@@ -20,30 +20,95 @@ get_targets_from_csv <- function(mirnas, static_df = mirna_static_targets) {
   static_df %>% filter(mirna %in% mirnas)
 }
 
-# ==== Helper: Enrichment Plot ====
 renderEnrichPlot <- function(df) {
-  if (is.null(df) || nrow(df) == 0) return(NULL)
+  if (is.null(df) || nrow(df) == 0) {
+    message("⚠️ Enrichment plot: input is NULL or empty.")
+    return(NULL)
+  }
   
-  top_terms <- df %>% arrange(Adjusted.P.value) %>% head(10)
+  df <- as.data.frame(df)
+  
+  # Normalize column names
+  original_names <- colnames(df)
+  colnames(df) <- tolower(gsub("\\.|\\s", "_", colnames(df)))
+  message("🧬 Normalized column names: ", paste(colnames(df), collapse = ", "))
+  
+  # Explicit mapping for expected columns
+  adj_p_col <- which(colnames(df) %in% c("adjusted_p_value", "adjusted.p.value", "adj_p", "padj"))[1]
+  term_col <- which(colnames(df) %in% c("term", "description"))[1]
+  overlap_col <- which(colnames(df) %in% c("overlap", "count", "gene_ratio"))[1]
+  
+  if (is.na(adj_p_col) || is.na(term_col)) {
+    message("❌ Required columns (adjusted p-value or term) not found. Cannot plot.")
+    return(NULL)
+  }
+  
+  # Rename for consistency
+  df <- df %>%
+    dplyr::rename(
+      adj_p = colnames(df)[adj_p_col],
+      term = colnames(df)[term_col]
+    )
+  
+  if (!is.na(overlap_col)) {
+    df <- dplyr::rename(df, overlap = colnames(df)[overlap_col])
+  } else {
+    df$overlap <- NA
+  }
+  
+  top_terms <- df %>%
+    arrange(adj_p) %>%
+    slice_head(n = 10)
+  
+  message("✅ Plotting top enrichment terms:")
+  print(top_terms[, c("term", "adj_p", "overlap")])
   
   plot_ly(
     data = top_terms,
-    x = ~reorder(Term, -Adjusted.P.value),
-    y = ~-log10(Adjusted.P.value),
+    x = ~reorder(term, -log10(adj_p)),
+    y = ~-log10(adj_p),
     type = "bar",
-    text = ~paste("Term:", Term,
-                  "<br>Adj. P:", signif(Adjusted.P.value, 3),
-                  "<br>Overlap:", Overlap),
+    text = ~paste0("Term: ", term,
+                   "<br>Adj. P: ", signif(adj_p, 3),
+                   ifelse(is.na(overlap), "", paste0("<br>Overlap: ", overlap))),
     hoverinfo = "text",
     marker = list(color = "steelblue")
   ) %>%
     layout(
-      title = "-log10(Adj. P) of Top Enriched Pathways",
-      xaxis = list(title = "Pathway", tickangle = -45),
+      title = "-log10(Adjusted P) of Top Enriched Terms",
+      xaxis = list(title = "Term", tickangle = -45),
       yaxis = list(title = "-log10(Adjusted P-value)"),
       margin = list(b = 120)
     )
 }
+
+
+renderEnrichTable <- function(df) {
+  if (is.null(df) || nrow(df) == 0) return(data.frame(Message = "No enrichment results available"))
+  
+  df <- as.data.frame(df)
+  
+  # Normalize column names
+  names(df) <- gsub("\\.", "_", names(df))
+  names(df) <- trimws(names(df))
+  
+  # Try to find common enrichment-related columns
+  adj_p_col <- grep("^adj.*p|p_adjust", tolower(names(df)), value = TRUE)[1]
+  term_col <- grep("term|description", tolower(names(df)), value = TRUE)[1]
+  overlap_col <- grep("overlap|gene.*ratio|count", tolower(names(df)), value = TRUE)[1]
+  
+  # Rename for consistent display
+  names(df)[names(df) == adj_p_col] <- "Adjusted_P_value"
+  names(df)[names(df) == term_col] <- "Term"
+  if (!is.na(overlap_col)) names(df)[names(df) == overlap_col] <- "Overlap"
+  
+  # Return a simplified subset
+  out <- df[, c("Term", "Adjusted_P_value", "Overlap"), drop = FALSE]
+  out$Adjusted_P_value <- signif(out$Adjusted_P_value, 4)
+  
+  return(out)
+}
+
 
 # ==== Database choices ====
 db_choices <- c(
@@ -53,20 +118,92 @@ db_choices <- c(
   "KEGG_2021_Human",
   "Reactome_2022"
 )
-
-# ==== Safe wrapper around enrichR call ====
-safe_enrichr <- function(genes, db = "KEGG_2021_Human") {
-  if (length(genes) < 2) return(data.frame())
-  res <- tryCatch({
-    result <- enrichR::enrichr(genes, databases = db)
-    if (is.null(result[[db]]) || nrow(result[[db]]) == 0) return(data.frame())
-    result[[db]]
+robust_enrichment <- function(genes, db = "KEGG_2021_Human") {
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(enrichR)
+  
+  # 🧼 Clean the input gene list
+  genes <- unique(na.omit(genes))
+  genes <- genes[genes != ""]
+  genes <- genes[grepl("^[A-Za-z0-9\\-]+$", genes)]
+  
+  if (length(genes) < 2) {
+    message("⚠️ Not enough valid genes for enrichment.")
+    return(data.frame())
+  }
+  
+  message("🧬 Cleaned gene list length: ", length(genes))
+  message("📡 Submitting to Enrichr... DB: ", db)
+  
+  # ==== TRY Enrichr with content sanity check ====
+  result <- tryCatch({
+    enr <- enrichr(genes, databases = db)
+    df <- enr[[db]]
+    
+    # 🧪 Check for expected result structure
+    if (is.null(df) || nrow(df) == 0) stop("Empty result from Enrichr")
+    required_cols <- c("Adjusted.P.value", "Term", "Overlap")
+    if (!all(required_cols %in% colnames(df))) stop("Invalid result format from Enrichr")
+    
+    message("✅ Enrichr enrichment succeeded.")
+    df
   }, error = function(e) {
-    message("❌ Enrichment error: ", e$message)
+    message("❌ Enrichr failed or returned malformed data: ", e$message)
+    NULL
+  })
+  
+  if (!is.null(result)) {
+    return(result)
+  }
+  
+  # ==== Fallback to clusterProfiler ====
+  message("⏪ Switching to clusterProfiler fallback...")
+  
+  entrez <- tryCatch({
+    bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  }, error = function(e) {
+    message("❌ Failed to convert gene symbols to Entrez IDs.")
     return(data.frame())
   })
-  return(res)
+  
+  if (nrow(entrez) < 2) {
+    message("⚠️ Not enough mapped genes for clusterProfiler.")
+    return(data.frame())
+  }
+  
+  fallback_res <- NULL
+  
+  if (grepl("KEGG", db, ignore.case = TRUE)) {
+    fallback_res <- tryCatch({
+      enrichKEGG(gene = entrez$ENTREZID, organism = "hsa", pAdjustMethod = "BH")
+    }, error = function(e) {
+      message("❌ KEGG fallback failed: ", e$message)
+      return(data.frame())
+    })
+  } else {
+    fallback_res <- tryCatch({
+      enrichGO(gene = entrez$ENTREZID,
+               OrgDb = org.Hs.eg.db,
+               keyType = "ENTREZID",
+               ont = "BP",
+               pAdjustMethod = "BH")
+    }, error = function(e) {
+      message("❌ GO fallback failed: ", e$message)
+      return(data.frame())
+    })
+  }
+  
+  if (is.null(fallback_res) || nrow(as.data.frame(fallback_res)) == 0) {
+    message("⚠️ clusterProfiler returned no results.")
+    return(data.frame())
+  }
+  
+  showNotification("⚠️ Enrichr failed. clusterProfiler used as fallback.", type = "warning")
+  
+  return(as.data.frame(fallback_res))
 }
+
 
 # ==== UI ====
 ui <- fluidPage(
@@ -112,10 +249,12 @@ ui <- fluidPage(
                  tabsetPanel(
                    tabPanel("Enrichment Table",
                             downloadButton("downloadEnrichAll", "Download CSV"),
-                            br(), br(), tableOutput("enrichAllTable")),
+                            br(), br(),
+                            tableOutput("enrichAllTable")),
                    tabPanel("Enrichment Barplot", plotlyOutput("enrichAllPlot"))
                  )
         ),
+        
         tabPanel("Enrich: Upregulated",
                  tabsetPanel(
                    tabPanel("Enrichment Table",
@@ -181,13 +320,15 @@ server <- function(input, output, session) {
       return(NULL)
     }
     
-    result <- safe_enrichr(tg, input$selectedDB)
+    result <- robust_enrichment(tg, input$selectedDB)
     enrichAll(result)
     showNotification("✅ Enrichment complete (All RF)", type = "message")
   })
   
-  output$enrichAllTable <- renderTable({ req(enrichAll()); enrichAll() })
-  
+  output$enrichAllTable <- renderTable({
+    renderEnrichTable(enrichAll())
+  })
+
   output$downloadEnrichAll <- downloadHandler(
     filename = function() { "enrichment_all_rf_ranked.csv" },
     content = function(file) {
@@ -217,13 +358,14 @@ server <- function(input, output, session) {
       return(NULL)
     }
     
-    result <- safe_enrichr(tg, input$selectedDB)
+    result <- robust_enrichment(tg, input$selectedDB)
     enrichUp(result)
     showNotification("✅ Enrichment done (Upregulated)", type = "message")
   })
-  
-  output$enrichUpTable <- renderTable({ req(enrichUp()); enrichUp() })
-  
+  output$enrichUpTable <- renderTable({
+    renderEnrichTable(enrichUp())
+  })
+
   output$downloadEnrichUp <- downloadHandler(
     filename = function() { "enrichment_upregulated_rf.csv" },
     content = function(file) {
@@ -253,13 +395,14 @@ server <- function(input, output, session) {
       return(NULL)
     }
     
-    result <- safe_enrichr(tg, input$selectedDB)
+    result <- robust_enrichment(tg, input$selectedDB)
     enrichDown(result)
     showNotification("✅ Enrichment done (Downregulated)", type = "message")
   })
-  
-  output$enrichDownTable <- renderTable({ req(enrichDown()); enrichDown() })
-  
+  output$enrichDownTable <- renderTable({
+    renderEnrichTable(enrichDown())
+  })
+
   output$downloadEnrichDown <- downloadHandler(
     filename = function() { "enrichment_downregulated_rf.csv" },
     content = function(file) {
@@ -424,30 +567,92 @@ observeEvent(input$runRF, {
   rownames(vst_mat_renamed) <- make.names(rownames(vst_mat))
   
   sig_miRNAs_clean <- make.names(sig_miRNAs)
-  
   vst_subset <- vst_mat_renamed[rownames(vst_mat_renamed) %in% sig_miRNAs_clean, , drop = FALSE]
+  
   df_rf <- as.data.frame(t(vst_subset))
   df_rf$condition <- factor(vsdData()$condition)
   
-  rf <- randomForest(condition ~ ., data = df_rf, importance = TRUE)
-  preds <- predict(rf, type = "response")
+  # ==== Train/test split ====
+  set.seed(123)  # For reproducibility
+  train_idx <- sample(seq_len(nrow(df_rf)), size = 0.7 * nrow(df_rf))
+  train_data <- df_rf[train_idx, ]
+  test_data  <- df_rf[-train_idx, ]
   
-  # === Predictions
-  rf_preds(data.frame(Sample = rownames(df_rf), Predicted = preds))
+  # ==== Train model ====
+  rf <- randomForest(condition ~ ., data = train_data, importance = TRUE)
   
-  # === Metrics
-  actual <- df_rf$condition
+  # ==== Predictions ====
+  
+  
+  preds <- predict(rf, newdata = test_data, type = "response")
+  pred_probs <- predict(rf, newdata = test_data, type = "prob")[, 1]  # AUC uses prob for 1st class
+  
+  rf_preds(data.frame(Sample = rownames(test_data), Predicted = preds))
+  
+  # ==== Metrics ositive_class <- "Primary Tumor"
+  
+  # Ensure the factor levels are in correct order, with positive class second (for clarity in ROC)
+  df_rf$condition <- factor(df_rf$condition, levels = c("Solid Tissue Normal", "Primary Tumor"))
+  train_data <- df_rf[train_idx, ]
+  test_data <- df_rf[-train_idx, ]
+  
+  # Train model
+  rf <- randomForest(condition ~ ., data = train_data, importance = TRUE)
+  # Set positive class explicitly
+  positive_class <- "Primary Tumor"
+  
+  # Make sure factor levels are consistent and correctly ordered
+  test_data$condition <- factor(test_data$condition, levels = c("Solid Tissue Normal", "Primary Tumor"))
+  
+  # Predict class labels and probabilities
+  preds <- predict(rf, newdata = test_data, type = "response")
+  pred_probs <- predict(rf, newdata = test_data, type = "prob")[, positive_class]
+  
+  # Actual labels
+  actual <- test_data$condition
+  preds <- as.factor(preds)
+  actual <- as.factor(actual)
+  
+  # Confusion matrix
   confusion <- table(Predicted = preds, Actual = actual)
   accuracy <- sum(diag(confusion)) / sum(confusion)
-  rf_metrics(data.frame(Metric = "Accuracy", Value = accuracy))
   
-  # === Importance
+  # Sensitivity & Specificity (for "Primary Tumor")
+  TP <- confusion[positive_class, positive_class]
+  FN <- sum(confusion[, positive_class]) - TP
+  FP <- sum(confusion[positive_class, ]) - TP
+  TN <- sum(confusion) - TP - FN - FP
+  
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  
+  # AUC
+  if (length(unique(actual)) == 2) {
+    roc_obj <- pROC::roc(actual, pred_probs, levels = c("Solid Tissue Normal", "Primary Tumor"), direction = "<")
+    auc <- as.numeric(pROC::auc(roc_obj))
+  } else {
+    auc <- NA
+    message("⚠️ AUC not applicable: more than two classes.")
+  }
+  
+  # Compile metrics
+  metrics_df <- data.frame(
+    Metric = c("Accuracy", "Sensitivity", "Specificity", "AUC"),
+    Value = c(accuracy, sensitivity, specificity, auc)
+  )
+  
+
+  
+  rf_metrics(metrics_df)
+  
+  # ==== Importance ====
   imp <- importance(rf, type = 2)
   rf_importance(data.frame(miRNA = rownames(imp), Importance = imp[, 1]) %>%
                   arrange(desc(Importance)))
   
   showNotification("✅ Random Forest complete", type = "message")
 })
+
 # === Random Forest Outputs ===
 
 output$rfPredictions <- renderTable({
@@ -657,6 +862,15 @@ observeEvent(input$barplotBtn, {
 
 
 
+output$downloadEnrichUp <- downloadHandler(
+  filename = function() {
+    paste0("enrichment_upregulated_", Sys.Date(), ".csv")
+  },
+  content = function(file) {
+    req(enrichUp())
+    write.csv(enrichUp(), file, row.names = FALSE)
+  }
+)
 
 
 
@@ -666,5 +880,3 @@ observeEvent(input$barplotBtn, {
 }
 # ==== Final App Run ====
 shinyApp(ui, server)
-
-
