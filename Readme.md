@@ -96,6 +96,9 @@ Then submit with
 sbatch run_app.sbatch
 Check the output log for the URL to connect (you may need to expose ports through your cluster's web gateway or use port forwarding with SSH).
 
+🔹 Sample count and metadata files are provided in the [`mi_rna_data`](https://github.com/jcaperella29/MI_RNA_SHINY/tree/main/mi_rna_data) folder of this repository to help you get started quickly.
+
+
 
 📂 Data Structure
 project/
