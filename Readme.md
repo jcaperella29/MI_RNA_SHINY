@@ -17,6 +17,16 @@ This interactive Shiny application allows users to perform and explore **differe
 
 ---
 
+## 🖼️ Screenshots
+
+### Differential Expression Table
+![Differential Expression Table](screenshots/Differential_expression_table.png)
+
+### Top miRNA Bar Plot
+![Top miRNA Bar Plot](screenshots/Top_Mirna_bar_plot.png)
+
+
+
 ## 🛠️ Tech Stack
 
 | Layer              | Tool/Library            |
