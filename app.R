@@ -211,6 +211,10 @@ robust_enrichment <- function(genes, db = "KEGG_2021_Human") {
 # ==== UI ====
 ui <- fluidPage(
   titlePanel("JCAP MiRNA-SEQ"),
+  tags$head(
+    tags$link(rel = "stylesheet", type = "text/css", href = "styles.css")
+  ),
+  
   sidebarLayout(
     sidebarPanel(
       fileInput("countsFile", "Upload Count Matrix CSV", accept = ".csv"),
@@ -245,12 +249,13 @@ ui <- fluidPage(
     ),
     mainPanel(
       tabsetPanel(
+        tabPanel("Top miRNAs", tableOutput("topTable")),
+        tabPanel("Top miRNA Barplot", plotlyOutput("barplotPlot")),
         tabPanel("Volcano", plotlyOutput("volcanoPlot")),
         tabPanel("PCA", plotlyOutput("pcaPlot")),
         tabPanel("UMAP", plotlyOutput("umapPlot")),
         tabPanel("Heatmap", plotlyOutput("heatmapPlot")),
-        tabPanel("Top miRNAs", tableOutput("topTable")),
-        tabPanel("Top miRNA Barplot", plotlyOutput("barplotPlot")),
+        
         tabPanel("Enrich: All DE",
                  tabsetPanel(
                    tabPanel("Enrichment Table",
@@ -285,12 +290,19 @@ ui <- fluidPage(
                  )
         ),
         
-        # 💡 Move Power Analysis here, as a top-level tabPanel (not nested!)
-        tabPanel("Power Table",
-                 downloadButton("downloadPowerTable", "Download Power Table (CSV)"),
-                 br(), br(),
-                 DT::dataTableOutput("power_table")
+        tabPanel("Power Analysis",
+                 tabsetPanel(
+                   tabPanel("Power Table",
+                            downloadButton("downloadPowerTable", "Download Power Table (CSV)"),
+                            br(), br(),
+                            DT::dataTableOutput("power_table")
+                   ),
+                   tabPanel("Power Plot",
+                            plotOutput("power_plot")
+                   )
+                 )
         ),
+        
         tabPanel("README",
                  h4("App User Guide"),
                  verbatimTextOutput("readmeText")
@@ -986,3 +998,4 @@ output$readmeText <- renderPrint({
 }
 # ==== Final App Run ====
 shinyApp(ui, server)
+
