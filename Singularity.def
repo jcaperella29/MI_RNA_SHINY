@@ -1,0 +1,38 @@
+# ---- Singularity.def ----
+Bootstrap: docker
+From: rocker/shiny:latest
+
+%labels
+    Author YourName
+    App miRNA_DE_App
+
+%post
+    apt-get update && apt-get install -y \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        libxml2-dev \
+        libfontconfig1-dev \
+        libfreetype6-dev \
+        libharfbuzz-dev \
+        libfribidi-dev \
+        libpng-dev \
+        libtiff-dev \
+        libjpeg-dev \
+        libgit2-dev \
+        libglpk-dev \
+        libudunits2-dev \
+        libgdal-dev \
+        libgeos-dev \
+        libproj-dev \
+        && apt-get clean
+
+    R -e "install.packages(c('shiny', 'DESeq2', 'ggplot2', 'dplyr', 'readr', 'plotly', 'umap', 'pheatmap', 'clusterProfiler', 'org.Hs.eg.db', 'enrichR', 'randomForest', 'pROC', 'pwr', 'DT', 'BiocManager'), repos='http://cran.r-project.org')" \
+        && R -e "BiocManager::install(c('DESeq2', 'org.Hs.eg.db', 'clusterProfiler'))"
+
+%environment
+    export APPDIR=/srv/shiny-server
+    export PORT=3838
+
+%runscript
+    cd $APPDIR
+    exec shiny-server
