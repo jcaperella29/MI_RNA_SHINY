@@ -115,6 +115,8 @@ Metadata File: CSV file with sample names and conditions (last column should be 
 
 
 
+Built with ❤️ and R to make bioinformatics just a little more magical.
+
 
 
 
