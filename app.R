@@ -12,6 +12,9 @@ library(pheatmap)
 library(enrichR)
 library(randomForest)
 library(pROC)
+library(pwr)
+library(DT)
+
 
 # ==== Load static miRNA-gene associations (CSV fallback) ====
 mirna_static_targets <- read.csv("data/mirna_targets.csv", stringsAsFactors = FALSE)
@@ -207,7 +210,7 @@ robust_enrichment <- function(genes, db = "KEGG_2021_Human") {
 
 # ==== UI ====
 ui <- fluidPage(
-  titlePanel("miRNA Differential Expression (DESeq2)"),
+  titlePanel("JCAP MiRNA-SEQ"),
   sidebarLayout(
     sidebarPanel(
       fileInput("countsFile", "Upload Count Matrix CSV", accept = ".csv"),
@@ -234,7 +237,10 @@ ui <- fluidPage(
       actionButton("plotEnrichDownBtn", "Plot: Downregulated Enrichment"),
       hr(),
       actionButton("runRF", "Run Random Forest Classification"),
+      actionButton("runPower", "Run Power Analysis"),
+      
       hr(),
+      
       downloadButton("downloadTop", "Download Top DE miRNAs")
     ),
     mainPanel(
@@ -277,11 +283,28 @@ ui <- fluidPage(
                    tabPanel("Metrics", downloadButton("downloadRFmetrics", "Download Metrics"), br(), br(), tableOutput("rfMetrics")),
                    tabPanel("Variable Importance", downloadButton("downloadRFimportance", "Download Importance Table"), br(), br(), tableOutput("rfImportance"))
                  )
+        ),
+        
+        # 💡 Move Power Analysis here, as a top-level tabPanel (not nested!)
+        tabPanel("Power Table",
+                 downloadButton("downloadPowerTable", "Download Power Table (CSV)"),
+                 br(), br(),
+                 DT::dataTableOutput("power_table")
+        ),
+        tabPanel("README",
+                 h4("App User Guide"),
+                 verbatimTextOutput("readmeText")
+        )
+        
+        
+        )
+        
+                 
         )
       )
     )
-  )
-)
+  
+
 # ==== SERVER ====
 server <- function(input, output, session) {
   # Reactive values
@@ -290,6 +313,7 @@ server <- function(input, output, session) {
   ddsData <- reactiveVal(NULL)
   vsdData <- reactiveVal(NULL)
   heatmapMatrix <- reactiveVal(NULL)
+  power_matrix <- reactiveVal(NULL)
   
   enrichAll <- reactiveVal(NULL)
   enrichUp <- reactiveVal(NULL)
@@ -872,8 +896,90 @@ output$downloadEnrichUp <- downloadHandler(
   }
 )
 
+observeEvent(input$runPower, {
+  req(vsdData())
+  
+  showNotification("⚙️ Running power analysis...", type = "message", duration = NULL)
+  on.exit(showNotification("✅ Power analysis complete!", type = "message"), add = TRUE)
+  vst <- assay(vsdData())
+  condition <- factor(vsdData()$condition)
+  
+  group1_idx <- which(condition == "Primary Tumor")
+  group2_idx <- which(condition == "Solid Tissue Normal")
+  n_range <- seq(5, 100, by = 5)
+  
+  gene_names <- rownames(vst)
+  power_results <- matrix(NA, nrow = length(gene_names), ncol = length(n_range),
+                          dimnames = list(gene_names, paste0("n=", n_range)))
+  
+  for (i in seq_along(gene_names)) {
+    vals <- vst[gene_names[i], ]
+    g1 <- vals[group1_idx]
+    g2 <- vals[group2_idx]
+    
+    pooled_sd <- sd(c(g1, g2))
+    if (pooled_sd == 0) next
+    d <- abs(mean(g1) - mean(g2)) / pooled_sd
+    
+    powers <- sapply(n_range, function(n) {
+      pwr.t.test(n = n, d = d, sig.level = 0.05, type = "two.sample")$power
+    })
+    
+    power_results[i, ] <- powers
+  }
+  
+  power_matrix(as.data.frame(power_results))
+})
+
+output$power_table <- DT::renderDataTable({
+  req(power_matrix())
+  df <- power_matrix()
+  df$Gene <- rownames(df)
+  df[, c("Gene", colnames(df)[-ncol(df)])]
+})
+
+output$power_plot <- renderPlot({
+  req(power_matrix())
+  df <- power_matrix()
+  
+  sample_sizes <- as.numeric(gsub("n=", "", colnames(df)))
+  
+  min_sample_sizes <- apply(df, 1, function(powers) {
+    idx <- which(powers >= 0.8)
+    if (length(idx) > 0) return(sample_sizes[min(idx)])
+    return(NA)
+  })
+  
+  plot_df <- data.frame(
+    Gene = rownames(df),
+    MinSampleSizeFor80Power = min_sample_sizes
+  )
+  
+  plot_df <- na.omit(plot_df)
+  
+  boxplot(plot_df$MinSampleSizeFor80Power,
+          main = "Sample Size Needed for 80% Power (per miRNA)",
+          ylab = "Sample Size Per Group",
+          col = "skyblue", notch = TRUE)
+  
+  abline(h = median(plot_df$MinSampleSizeFor80Power, na.rm = TRUE), col = "red", lty = 2)
+})
 
 
+output$downloadPowerTable <- downloadHandler(
+  filename = function() {
+    paste0("Power_Analysis_Table_", Sys.Date(), ".csv")
+  },
+  content = function(file) {
+    df <- power_matrix()
+    df$Gene <- rownames(df)
+    write.csv(df[, c("Gene", colnames(df)[-ncol(df)])], file, row.names = FALSE)
+  }
+)
+
+output$readmeText <- renderPrint({
+  cat(readLines("readme.txt"), sep = "\n")
+})
 
 
 
