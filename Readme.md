@@ -13,7 +13,7 @@ This interactive Shiny application allows users to perform and explore **differe
 - 🔋 Power analysis for sample size estimation across miRNAs
 - 💾 Exportable tables and plots
 - 📖 Built-in README tab for user guidance
-- 🧊 Dark theme UI with Skyrim-style styling (optional)
+- 🧊 Optional custom styling via `www/styles.css`
 
 ---
 
@@ -25,7 +25,7 @@ This interactive Shiny application allows users to perform and explore **differe
 ### Top miRNA Bar Plot
 ![Top miRNA Bar Plot](screenshots/Top_Mirna_bar_plot.png)
 
-
+---
 
 ## 🛠️ Tech Stack
 
@@ -38,7 +38,7 @@ This interactive Shiny application allows users to perform and explore **differe
 | ML Classification  | randomForest, pROC      |
 | Power Analysis     | pwr                     |
 | Containerization   | Docker, Singularity/Apptainer |
-| Optional Styling   | Custom CSS              |
+| Styling            | Custom CSS              |
 
 ---
 
@@ -47,88 +47,64 @@ This interactive Shiny application allows users to perform and explore **differe
 ### 📦 Prerequisites
 
 - [R (≥ 4.0)](https://www.r-project.org/)
-- R packages: `shiny`, `DESeq2`, `ggplot2`, `dplyr`, `plotly`, `umap`, `pheatmap`, `enrichR`, `clusterProfiler`, `org.Hs.eg.db`, `randomForest`, `pROC`, `pwr`, `DT`
-- [Docker](https://docs.docker.com/) or [Apptainer/Singularity](https://apptainer.org/)
-- Optional: RStudio or R command line for local use
+- Required R packages: `shiny`, `DESeq2`, `ggplot2`, `dplyr`, `plotly`, `umap`, `pheatmap`, `enrichR`, `clusterProfiler`, `org.Hs.eg.db`, `randomForest`, `pROC`, `pwr`, `DT`
+- Either:
+  - [Docker](https://docs.docker.com/)
+  - or [Apptainer/Singularity](https://apptainer.org/)
+- Optional: RStudio for local development
 
 ---
 
-## 🧪 Local Use in R
+## 📂 Folder Structure
+
+mi_rna_shiny_deploy/
+├── app/
+│ ├── app.R
+│ ├── data/
+│ │ └── mirna_targets.csv
+│ ├── www/
+│ │ └── styles.css
+│ └── readme.txt
+├── Dockerfile
+├── Singularity.def
+├── miRNA_shiny.sif # Built container image
+├── launch_shiny.sbatch # SLURM job script
+├── logs/ # Output from SLURM jobs
+└── screenshots/ # PNGs for README or demos
+
+---
+
+## 💻 Local Use (in R/RStudio)
 
 ```r
-# Clone repository and run from R or RStudio
-shiny::runApp("path/to/app")
-
-Ensure the following files exist:
-
-app.R
-
-/data/mirna_targets.csv
-
-/www/styles.css
-
-readme.txt
-
-🐳 Docker Deployment
-Build
-in bash
-docker build -t mirna-de-app .
-
-Then open: http://localhost:3838 in your browser.
+shiny::runApp("app")
 
 
-🧬 Singularity / Apptainer Deployment (for HPC)
-
+🧬 Singularity / Apptainer Deployment (HPC)
 Step 1: Build the container
-in bash
-apptainer build mirna-de-app.sif Singularity.def
-Step 2: Run interactively on an HPC login node (for testing)
-in bash
-apptainer shell mirna-de-app.sif
-cd /srv/shiny-server
-shiny-server
-Step 3: Submit to a compute node (e.g. via SLURM)
-Create a job script run_app.sbatch:
 
 in bash
-#!/bin/bash
-#SBATCH --job-name=mirna_app
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=8G
-#SBATCH --time=01:00:00
-#SBATCH --output=shiny_app.out
+apptainer build miRNA_shiny.sif Singularity.def
 
-module load apptainer
-apptainer run mirna-de-app.sif
-Then submit with
+Step 2: Submit to SLURM
+in bash
 
+sbatch launch_shiny.sbatch
 
-sbatch run_app.sbatch
-Check the output log for the URL to connect (you may need to expose ports through your cluster's web gateway or use port forwarding with SSH).
+then  📡 Tunnel to the HPC port to access the app:
+ssh -N -L 3838:localhost:3838 your_user@hpc.domain.edu
 
-🔹 Sample count and metadata files are provided in the [`mi_rna_data`](https://github.com/jcaperella29/MI_RNA_SHINY/tree/main/mi_rna_data) folder of this repository to help you get started quickly.
+Then open: http://localhost:3838
+📖 Example Input Files
+Counts File: CSV file (rows = miRNAs, columns = samples)
 
+Metadata File: CSV file (first column = sample IDs, last column = condition)
 
+Sample data is provided under mi_rna_data
 
-📂 Data Structure
-project/
-├── app.R
-├── Singularity.def
-├── Dockerfile
-├── data/
-│   └── mirna_targets.csv
-├── www/
-│   └── styles.css
-├── readme.txt
+🧠 Credits
+Built with ❤️ and R to make bioinformatics more accessible, interactive, and powerful.
 
-📖 Example Input Requirements
-Counts File: A CSV matrix of raw counts (rows = miRNAs, columns = samples)
-
-Metadata File: CSV file with sample names and conditions (last column should be the condition)
-
-
-
-Built with ❤️ and R to make bioinformatics just a little more magical.
 
 
 
