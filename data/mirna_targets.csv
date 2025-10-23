@@ -1,7 +1,5 @@
-# Human (your origina
-
-
 mirna,target
+# ---- Human (your original) ----
 hsa-mir-21,PTEN
 hsa-mir-21,PDCD4
 hsa-mir-21,TIMP3
@@ -152,6 +150,4 @@ dme-miR-8,wg
 dme-miR-7,aop
 dme-miR-7,klu
 dme-miR-1,Mef2
-
-
 
