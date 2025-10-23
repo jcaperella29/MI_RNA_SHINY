@@ -3,10 +3,19 @@ Bootstrap: docker
 From: rocker/shiny:latest
 
 %labels
-    Author YourName
-    App miRNA_DE_App
+    Maintainer JCAP_BIOINFORMATICS
+    App miRNA_DE_Explorer
+    Description Multi-species miRNA differential expression, enrichment, and machine learning app
+
+%environment
+    export APPDIR=/app
+    export PORT=3838
+    export SHINY_PORT=3838
+    export DEBIAN_FRONTEND=noninteractive
+    export MAKEFLAGS="-j4"
 
 %post
+    set -e
     apt-get update && apt-get install -y \
         libcurl4-openssl-dev \
         libssl-dev \
@@ -24,15 +33,34 @@ From: rocker/shiny:latest
         libgdal-dev \
         libgeos-dev \
         libproj-dev \
+        libxt-dev \
+        pandoc \
         && apt-get clean
 
-    R -e "install.packages(c('shiny', 'DESeq2', 'ggplot2', 'dplyr', 'readr', 'plotly', 'umap', 'pheatmap', 'clusterProfiler', 'org.Hs.eg.db', 'enrichR', 'randomForest', 'pROC', 'pwr', 'DT', 'BiocManager'), repos='http://cran.r-project.org')" \
-        && R -e "BiocManager::install(c('DESeq2', 'org.Hs.eg.db', 'clusterProfiler'))"
+    # ---- Core CRAN packages ----
+    R -e "install.packages(c(
+        'shiny','shinyjs','plotly','DT','markdown','ggplot2','dplyr','readr','umap',
+        'pheatmap','randomForest','pROC','pwr','digest','BiocManager'
+    ), repos='https://cloud.r-project.org')"
 
-%environment
-    export APPDIR=/srv/shiny-server
-    export PORT=3838
+    # ---- Bioconductor packages ----
+    R -e "BiocManager::install(c(
+        'DESeq2','org.Hs.eg.db','org.Mm.eg.db','org.Dr.eg.db','org.Dm.eg.db',
+        'clusterProfiler','multiMiR','miRNAtap','gprofiler2'
+    ), ask=FALSE, update=TRUE, dependencies=TRUE)"
+
+    # ---- Verify installs ----
+    R -e "stopifnot(requireNamespace('multiMiR', quietly=TRUE))"
+    R -e "stopifnot(requireNamespace('miRNAtap', quietly=TRUE))"
+    R -e "stopifnot(requireNamespace('gprofiler2', quietly=TRUE))"
+    R -e "stopifnot(requireNamespace('DESeq2', quietly=TRUE))"
+
+%files
+    app.R /app/app.R
+    readme.txt /app/readme.txt
+    data/mirna_targets.csv /app/data/mirna_targets.csv
 
 %runscript
+    echo "🚀 Launching JCAP miRNA Differential Expression Explorer..."
     cd $APPDIR
-    exec shiny-server
+    exec R -e "shiny::runApp('/app', port=3838, host='0.0.0.0')"
