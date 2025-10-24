@@ -5,7 +5,7 @@ From: rocker/shiny:latest
 %labels
     Maintainer JCAP_BIOINFORMATICS
     App miRNA_DE_Explorer
-    Description Multi-species miRNA differential expression, enrichment, and machine learning app
+    Description Multi-species miRNA differential expression, enrichment, and ML app
 
 %environment
     export APPDIR=/app
@@ -16,44 +16,70 @@ From: rocker/shiny:latest
 
 %post
     set -e
-    apt-get update && apt-get install -y \
-        libcurl4-openssl-dev \
-        libssl-dev \
-        libxml2-dev \
-        libfontconfig1-dev \
-        libfreetype6-dev \
-        libharfbuzz-dev \
-        libfribidi-dev \
-        libpng-dev \
-        libtiff-dev \
-        libjpeg-dev \
-        libgit2-dev \
-        libglpk-dev \
-        libudunits2-dev \
-        libgdal-dev \
-        libgeos-dev \
-        libproj-dev \
-        libxt-dev \
-        pandoc \
-        && apt-get clean
+   apt-get update && apt-get install -y \
+    libcurl4-openssl-dev \
+    libssl-dev \
+    libxml2-dev \
+    libfontconfig1-dev \
+    libfreetype6-dev \
+    libharfbuzz-dev \
+    libfribidi-dev \
+    libpng-dev \
+    libtiff-dev \
+    libjpeg-dev \
+    libgit2-dev \
+    libglpk-dev \
+    libudunits2-dev \
+    libgdal-dev \
+    libgeos-dev \
+    libproj-dev \
+    libxt-dev \
+    libz-dev \
+    pandoc \
+    && apt-get clean
+
+
+    # Make app dir (and data subdir) before %files stage
+    mkdir -p /app/data
 
     # ---- Core CRAN packages ----
     R -e "install.packages(c(
         'shiny','shinyjs','plotly','DT','markdown','ggplot2','dplyr','readr','umap',
-        'pheatmap','randomForest','pROC','pwr','digest','BiocManager'
+        'pheatmap','randomForest','pROC','pwr','digest','enrichR','R.utils'
     ), repos='https://cloud.r-project.org')"
 
     # ---- Bioconductor packages ----
-    R -e "BiocManager::install(c(
-        'DESeq2','org.Hs.eg.db','org.Mm.eg.db','org.Dr.eg.db','org.Dm.eg.db',
-        'clusterProfiler','multiMiR','miRNAtap','gprofiler2'
-    ), ask=FALSE, update=TRUE, dependencies=TRUE)"
+    R -e "install.packages('BiocManager', repos='https://cloud.r-project.org')"
+   R -e "BiocManager::install(c(
+    'DESeq2',
+    'AnnotationDbi',
+    'org.Hs.eg.db','org.Mm.eg.db','org.Dr.eg.db','org.Dm.eg.db',
+    'clusterProfiler',
+    'multiMiR',
+    'miRNAtap',
+    'biomaRt',
+    'KEGGREST',
+    'igraph'
+), ask=FALSE, update=TRUE, dependencies=TRUE)"
 
-    # ---- Verify installs ----
-    R -e "stopifnot(requireNamespace('multiMiR', quietly=TRUE))"
-    R -e "stopifnot(requireNamespace('miRNAtap', quietly=TRUE))"
-    R -e "stopifnot(requireNamespace('gprofiler2', quietly=TRUE))"
+
+    # gprofiler2 is CRAN (works better than installing via BiocManager)
+    R -e "install.packages('gprofiler2', repos='https://cloud.r-project.org')"
+  
+
+
+    # ---- Verify installs (no miRNAtap required) ----
     R -e "stopifnot(requireNamespace('DESeq2', quietly=TRUE))"
+    R -e "stopifnot(requireNamespace('multiMiR', quietly=TRUE))"
+    R -e "stopifnot(requireNamespace('gprofiler2', quietly=TRUE))"
+    R -e "stopifnot(requireNamespace('clusterProfiler', quietly=TRUE))"
+    R -e "stopifnot(requireNamespace('AnnotationDbi', quietly=TRUE))"
+    R -e "stopifnot(requireNamespace('org.Mm.eg.db', quietly=TRUE))"
+    R -e "stopifnot(requireNamespace('org.Dr.eg.db', quietly=TRUE))"
+    R -e "stopifnot(requireNamespace('org.Dm.eg.db', quietly=TRUE))"
+    R -e "stopifnot(requireNamespace('enrichR', quietly=TRUE))"
+    R -e "stopifnot(requireNamespace('R.utils', quietly=TRUE))"
+    R -e "stopifnot(requireNamespace('digest', quietly=TRUE))"
 
 %files
     app.R /app/app.R
@@ -63,4 +89,6 @@ From: rocker/shiny:latest
 %runscript
     echo "🚀 Launching JCAP miRNA Differential Expression Explorer..."
     cd $APPDIR
-    exec R -e "shiny::runApp('/app', port=3838, host='0.0.0.0')"
+    # Prevent the 'Shiny Server v0.3.4' confusion by unsetting the variable:
+    exec R -e "Sys.unsetenv('SHINY_SERVER_VERSION'); options(shiny.host='0.0.0.0', shiny.port=3838); shiny::runApp('/app', launch.browser=FALSE)"
+
