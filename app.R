@@ -5,20 +5,29 @@ suppressPackageStartupMessages({
   library(DESeq2); library(umap); library(pwr); library(randomForest); library(pROC)
   library(clusterProfiler); library(org.Hs.eg.db)
   library(enrichR)
-  library(multiMiR)       # human/mouse validated targets
-  library(miRNAtap)       # predicted targets (all 4 species)
-  library(gprofiler2)     # multi-species enrichment
+  library(multiMiR)       # targets (validated + predicted) for hs/mm
+       
+  library(gprofiler2)     # REAC/WP & fallback
+  library(org.Mm.eg.db)   # mouse OrgDb
+  library(AnnotationDbi)  # ID mapping
+  library(digest)         # cache key
+  library(R.utils)        # timeouts
+  library(org.Dr.eg.db)   # zebrafish
+  library(org.Dm.eg.db)   # fly
+         # already used for timeouts
+  
 })
 
-# ---- Static CSV fallback (kept from your app) ----
+options(timeout = 15)  # cap slow network calls
+
+# ---- Static CSV fallback (kept) ----
 mirna_static_targets <- tryCatch(
   read.csv("data/mirna_targets.csv", stringsAsFactors = FALSE),
   error = function(e) data.frame(mirna=character(), target=character())
 )
-
 get_targets_from_csv <- function(mirnas, static_df = mirna_static_targets) {
   if (nrow(static_df) == 0) return(static_df)
-  static_df %>% filter(tolower(mirna) %in% tolower(mirnas))
+ static_df %>% filter(tolower(mirna) %in% tolower(mirnas))
 }
 
 # ---- Species helpers ----
@@ -38,66 +47,374 @@ species_labels <- c(
   "Zebrafish (dre-miR-…)"       = "dr",
   "Fly (dme-miR-…)"             = "dm"
 )
-# multiMiR org codes (validated only for hs/mm)
-MM_ORG <- c(hs = "hsa", mm = "mmu")
-# miRNAtap taxon IDs (predicted)
-TAP_TAX <- c(hs = 9606, mm = 10090, dr = 7955, dm = 7227)
+MM_ORG <- c(hs = "hsa", mm = "mmu")  # multiMiR org codes
+# TAP_TAX left unused intentionally to avoid miRNAtap
+# ===================== Enrichment helpers (TOP-LEVEL) =====================
 
-# ---- Target retrieval (validated + predicted + CSV fallback) ----
+# -- Safe AnnotationDbi::select wrapper (de-dup + valid keys only)
+safe_select <- function(orgdb, keys, keytype, columns) {
+  keys <- unique(as.character(keys))
+  keys <- keys[!is.na(keys) & keys != ""]
+  if (!length(keys)) return(data.frame())
+  valid <- AnnotationDbi::keys(orgdb, keytype = keytype)
+  keys  <- intersect(keys, valid)
+  if (!length(keys)) return(data.frame())
+  out <- AnnotationDbi::select(orgdb, keys = keys, keytype = keytype, columns = columns)
+  dplyr::distinct(as.data.frame(out))
+}
+
+# -- Enrichr/g:Profiler DB menus by species
+enrichr_human_choices <- c(
+  "GO_Biological_Process_2021",
+  "GO_Molecular_Function_2021",
+  "GO_Cellular_Component_2021",
+  "KEGG_2021_Human",
+  "Reactome_2022",
+  "WikiPathway_2021_Human"
+)
+gprof_sources <- c("GO:BP","KEGG","REAC","WP")
+db_choices_for_species <- function(sp) if (sp == "hs") enrichr_human_choices else gprof_sources
+
+# -- Enrichr pull with guards
+.enrichr_pull <- function(genes, db) {
+  ee <- try(enrichR::enrichr(genes, databases = db), silent = TRUE)
+  if (inherits(ee, "try-error") || is.null(ee)) return(data.frame())
+  out <- ee[[db]]
+  if (is.null(out) || !is.data.frame(out) || !nrow(out)) return(data.frame())
+  out
+}
+
+# ---------------------- Mouse (mmu): multiMiR → clusterProfiler ----------------------
+mm_targets_df <- function(mirnas) {
+  safe_mm <- function(org, mirs, table) {
+    try(R.utils::withTimeout(
+      multiMiR::get_multimir(org = org, mirna = mirs, table = table, summary = FALSE),
+      timeout = 25, onTimeout = "error"
+    ), silent = TRUE)
+  }
+  v <- safe_mm("mmu", mirnas, "validated")
+  p <- safe_mm("mmu", mirnas, "predicted")
+  dat <- dplyr::bind_rows(
+    if (!inherits(v,"try-error") && !is.null(v) && nrow(v@data)) tibble::as_tibble(v@data) else NULL,
+    if (!inherits(p,"try-error") && !is.null(p) && nrow(p@data)) tibble::as_tibble(p@data) else NULL
+  )
+  if (!nrow(dat)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
+  df <- dat %>% dplyr::transmute(SYMBOL = as.character(target_symbol),
+                                 ENTREZID = as.character(target_entrez))
+  # backfill SYMBOL ⇄ ENTREZ
+  need_sym <- which((is.na(df$SYMBOL) | df$SYMBOL == "") & (!is.na(df$ENTREZID) & df$ENTREZID != ""))
+  if (length(need_sym)) {
+    map <- safe_select(org.Mm.eg.db, unique(df$ENTREZID[need_sym]), "ENTREZID", "SYMBOL")
+    if (nrow(map)) df$SYMBOL[need_sym] <- map$SYMBOL[match(df$ENTREZID[need_sym], map$ENTREZID)]
+  }
+  need_ent <- which((is.na(df$ENTREZID) | df$ENTREZID == "") & (!is.na(df$SYMBOL) & df$SYMBOL != ""))
+  if (length(need_ent)) {
+    map <- safe_select(org.Mm.eg.db, unique(df$SYMBOL[need_ent]), "SYMBOL", "ENTREZID")
+    if (nrow(map)) df$ENTREZID[need_ent] <- as.character(map$ENTREZID[match(df$SYMBOL[need_ent], map$SYMBOL)])
+  }
+  df %>% dplyr::filter(!is.na(ENTREZID), ENTREZID != "") %>% dplyr::distinct()
+}
+
+mm_enrich_from_targets <- function(target_df, db = "GO:BP", q = 0.05) {
+  if (!is.data.frame(target_df) || !nrow(target_df)) return(data.frame())
+  genes <- unique(target_df$ENTREZID); if (length(genes) < 10) return(data.frame())
+  if (db == "GO:BP") {
+    eg <- clusterProfiler::enrichGO(genes, OrgDb = org.Mm.eg.db, keyType = "ENTREZID",
+                                    ont = "BP", pAdjustMethod = "BH", qvalueCutoff = q, readable = TRUE)
+    df <- as.data.frame(eg); if (!nrow(df)) return(data.frame())
+    return(df %>% dplyr::transmute(Term = Description,
+                                   Adjusted.P.value = p.adjust,
+                                   Combined.Score = -log10(p.adjust)) %>% dplyr::arrange(Adjusted.P.value))
+  }
+  if (db == "KEGG") {
+    kk <- clusterProfiler::enrichKEGG(genes, organism = "mmu", pAdjustMethod = "BH", qvalueCutoff = q)
+    kk <- tryCatch(clusterProfiler::setReadable(kk, OrgDb = org.Mm.eg.db, keyType = "ENTREZID"), error = function(e) kk)
+    df <- as.data.frame(kk); if (!nrow(df)) return(data.frame())
+    return(df %>% dplyr::transmute(Term = Description,
+                                   Adjusted.P.value = p.adjust,
+                                   Combined.Score = -log10(p.adjust)) %>% dplyr::arrange(Adjusted.P.value))
+  }
+  gp <- try(gprofiler2::gost(query = genes, organism = "mmusculus", sources = db, correction_method = "g_SCS"), silent = TRUE)
+  if (!inherits(gp,"try-error") && !is.null(gp$result) && nrow(gp$result)>0) {
+    df <- gp$result; comb <- -log10(df$p_value)*(df$intersection_size/df$term_size)
+    return(data.frame(Term=df$term_name, Adjusted.P.value=df$p_value, Combined.Score=comb) %>% dplyr::arrange(Adjusted.P.value))
+  }
+  data.frame()
+}
+
+# ---------------------- Zebrafish (dre): human targets → orthology → drerio ----------------------
+.to_hsa_from_dre <- function(mi) sub("^dre-", "hsa-", as.character(mi), ignore.case = TRUE)
+
+dr_targets_df <- function(mirnas) {
+  hsa_mirs <- unique(stats::na.omit(.to_hsa_from_dre(mirnas)))
+  if (!length(hsa_mirs)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
+  pull_mm <- function(tbl) try(R.utils::withTimeout(
+    multiMiR::get_multimir(org="hsa", mirna=hsa_mirs, table=tbl, summary=FALSE),
+    timeout = 25, onTimeout="error"), silent=TRUE)
+  v <- pull_mm("validated"); p <- pull_mm("predicted")
+  hdat <- dplyr::bind_rows(
+    if (!inherits(v,"try-error") && !is.null(v) && nrow(v@data)) tibble::as_tibble(v@data) else NULL,
+    if (!inherits(p,"try-error") && !is.null(p) && nrow(p@data)) tibble::as_tibble(p@data) else NULL
+  )
+  if (!nrow(hdat)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
+  human_sym <- unique(hdat$target_symbol); human_sym <- human_sym[!is.na(human_sym) & human_sym != ""]
+  if (!length(human_sym)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
+  ortho <- try(gprofiler2::gorth(human_sym, "hsapiens", "drerio"), silent = TRUE)
+  if (inherits(ortho,"try-error") || is.null(ortho) || !nrow(ortho)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
+  sym_col <- intersect(c("ortholog_name","name","target_name","ortholog_gene_name"), colnames(ortho))
+  if (!length(sym_col)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
+  dr_sym <- unique(ortho[[sym_col[1]]]); dr_sym <- dr_sym[!is.na(dr_sym) & dr_sym != ""]
+  if (!length(dr_sym)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
+  map <- safe_select(org.Dr.eg.db, dr_sym, "SYMBOL", "ENTREZID")
+  if (!nrow(map)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
+  map %>% dplyr::transmute(SYMBOL=as.character(SYMBOL), ENTREZID=as.character(ENTREZID)) %>%
+    dplyr::filter(!is.na(ENTREZID),ENTREZID!="") %>% dplyr::distinct()
+}
+
+dr_enrich_from_targets <- function(target_df, db = "GO:BP", q = 0.05) {
+  if (!is.data.frame(target_df) || !nrow(target_df)) return(data.frame())
+  genes <- unique(target_df$ENTREZID); if (length(genes) < 10) return(data.frame())
+  if (db == "GO:BP") {
+    eg <- clusterProfiler::enrichGO(genes, OrgDb=org.Dr.eg.db, keyType="ENTREZID",
+                                    ont="BP", pAdjustMethod="BH", qvalueCutoff=q, readable=TRUE)
+    df <- as.data.frame(eg); if (!nrow(df)) return(data.frame())
+    return(df %>% dplyr::transmute(Term=Description, Adjusted.P.value=p.adjust,
+                                   Combined.Score=-log10(p.adjust)) %>% dplyr::arrange(Adjusted.P.value))
+  }
+  if (db == "KEGG") {
+    kk <- clusterProfiler::enrichKEGG(genes, organism="dre", pAdjustMethod="BH", qvalueCutoff=q)
+    kk <- tryCatch(clusterProfiler::setReadable(kk, OrgDb=org.Dr.eg.db, keyType="ENTREZID"), error=function(e) kk)
+    df <- as.data.frame(kk); if (!nrow(df)) return(data.frame())
+    return(df %>% dplyr::transmute(Term=Description, Adjusted.P.value=p.adjust,
+                                   Combined.Score=-log10(p.adjust)) %>% dplyr::arrange(Adjusted.P.value))
+  }
+  gp <- try(gprofiler2::gost(query=genes, organism="drerio", sources=db, correction_method="g_SCS"), silent=TRUE)
+  if (!inherits(gp,"try-error") && !is.null(gp$result) && nrow(gp$result)>0) {
+    df <- gp$result; comb <- -log10(df$p_value)*(df$intersection_size/df$term_size)
+    return(data.frame(Term=df$term_name, Adjusted.P.value=df$p_value, Combined.Score=comb) %>% dplyr::arrange(Adjusted.P.value))
+  }
+  data.frame()
+}
+
+# ---------------------- Fly (dme): human targets → orthology → dmel ----------------------
+.to_hsa_from_dme <- function(mi) sub("^dme-", "hsa-", as.character(mi), ignore.case = TRUE)
+
+dm_targets_df <- function(mirnas) {
+  hsa_mirs <- unique(stats::na.omit(.to_hsa_from_dme(mirnas)))
+  if (!length(hsa_mirs)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
+  pull_mm <- function(tbl) try(R.utils::withTimeout(
+    multiMiR::get_multimir(org="hsa", mirna=hsa_mirs, table=tbl, summary=FALSE),
+    timeout = 25, onTimeout="error"), silent=TRUE)
+  v <- pull_mm("validated"); p <- pull_mm("predicted")
+  hdat <- dplyr::bind_rows(
+    if (!inherits(v,"try-error") && !is.null(v) && nrow(v@data)) tibble::as_tibble(v@data) else NULL,
+    if (!inherits(p,"try-error") && !is.null(p) && nrow(p@data)) tibble::as_tibble(p@data) else NULL
+  )
+  if (!nrow(hdat)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
+  human_sym <- unique(hdat$target_symbol); human_sym <- human_sym[!is.na(human_sym) & human_sym != ""]
+  if (!length(human_sym)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
+  ortho <- try(gprofiler2::gorth(human_sym, "hsapiens", "dmelanogaster"), silent = TRUE)
+  if (inherits(ortho,"try-error") || is.null(ortho) || !nrow(ortho)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
+  sym_col <- intersect(c("ortholog_name","name","target_name","ortholog_gene_name"), colnames(ortho))
+  if (!length(sym_col)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
+  dm_sym <- unique(ortho[[sym_col[1]]]); dm_sym <- dm_sym[!is.na(dm_sym) & dm_sym != ""]
+  if (!length(dm_sym)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
+  map <- safe_select(org.Dm.eg.db, dm_sym, "SYMBOL", "ENTREZID")
+  if (!nrow(map)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
+  map %>% dplyr::transmute(SYMBOL=as.character(SYMBOL), ENTREZID=as.character(ENTREZID)) %>%
+    dplyr::filter(!is.na(ENTREZID),ENTREZID!="") %>% dplyr::distinct()
+}
+
+dm_enrich_from_targets <- function(target_df, db = "GO:BP", q = 0.05) {
+  if (!is.data.frame(target_df) || !nrow(target_df)) return(data.frame())
+  genes <- unique(target_df$ENTREZID); if (length(genes) < 10) return(data.frame())
+  if (db == "GO:BP") {
+    eg <- clusterProfiler::enrichGO(genes, OrgDb=org.Dm.eg.db, keyType="ENTREZID",
+                                    ont="BP", pAdjustMethod="BH", qvalueCutoff=q, readable=TRUE)
+    df <- as.data.frame(eg); if (!nrow(df)) return(data.frame())
+    return(df %>% dplyr::transmute(Term=Description, Adjusted.P.value=p.adjust,
+                                   Combined.Score=-log10(p.adjust)) %>% dplyr::arrange(Adjusted.P.value))
+  }
+  if (db == "KEGG") {
+    kk <- clusterProfiler::enrichKEGG(genes, organism="dme", pAdjustMethod="BH", qvalueCutoff=q)
+    kk <- tryCatch(clusterProfiler::setReadable(kk, OrgDb=org.Dm.eg.db, keyType="ENTREZID"), error=function(e) kk)
+    df <- as.data.frame(kk); if (!nrow(df)) return(data.frame())
+    return(df %>% dplyr::transmute(Term=Description, Adjusted.P.value=p.adjust,
+                                   Combined.Score=-log10(p.adjust)) %>% dplyr::arrange(Adjusted.P.value))
+  }
+  gp <- try(gprofiler2::gost(query=genes, organism="dmelanogaster", sources=db, correction_method="g_SCS"), silent=TRUE)
+  if (!inherits(gp,"try-error") && !is.null(gp$result) && nrow(gp$result)>0) {
+    df <- gp$result; comb <- -log10(df$p_value)*(df$intersection_size/df$term_size)
+    return(data.frame(Term=df$term_name, Adjusted.P.value=df$p_value, Combined.Score=comb) %>% dplyr::arrange(Adjusted.P.value))
+  }
+  data.frame()
+}
+
+# ---------------------- Generic cross-species enrich (fallback) ----------------------
+enrich_species <- function(genes, db, species) {
+  genes <- unique(stats::na.omit(genes)); genes <- genes[genes != ""]
+  if (length(genes) < 2) return(data.frame())
+  if (species == "hs" && db %in% enrichr_human_choices) {
+    ee <- .enrichr_pull(genes, db)
+    if (nrow(ee)) return(ee)
+    db <- switch(db,
+                 "GO_Biological_Process_2021" = "GO:BP",
+                 "GO_Molecular_Function_2021" = "GO:MF",
+                 "GO_Cellular_Component_2021" = "GO:CC",
+                 "KEGG_2021_Human"            = "KEGG",
+                 "Reactome_2022"              = "REAC",
+                 "WikiPathway_2021_Human"     = "WP",
+                 "GO:BP"
+    )
+  }
+  org <- switch(species, hs="hsapiens", mm="mmusculus", dr="drerio", dm="dmelanogaster", "hsapiens")
+  gp <- try(gprofiler2::gost(query=genes, organism=org, sources=db, correction_method="g_SCS"), silent=TRUE)
+  if (!inherits(gp,"try-error") && !is.null(gp$result) && nrow(gp$result)>0) {
+    df <- gp$result; comb <- -log10(df$p_value)*(df$intersection_size/df$term_size)
+    return(data.frame(Term=df$term_name, Adjusted.P.value=df$p_value, Combined.Score=comb) %>% dplyr::arrange(Adjusted.P.value))
+  }
+  data.frame()
+}
+
+# --- replace your mm_targets_df with this version ---
+mm_targets_df <- function(mirnas) {
+  safe_multimir <- function(org, mirnas, table) {
+    try(R.utils::withTimeout(
+      multiMiR::get_multimir(org = org, mirna = mirnas, table = table, summary = FALSE),
+      timeout = 25, onTimeout = "error"
+    ), silent = TRUE)
+  }
+  
+  v <- safe_multimir("mmu", mirnas, "validated")
+  p <- safe_multimir("mmu", mirnas, "predicted")
+  
+  dat <- dplyr::bind_rows(
+    if (!inherits(v,"try-error") && !is.null(v) && nrow(v@data)) tibble::as_tibble(v@data) else NULL,
+    if (!inherits(p,"try-error") && !is.null(p) && nrow(p@data)) tibble::as_tibble(p@data) else NULL
+  )
+  if (!nrow(dat)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
+  
+  df <- dat %>%
+    dplyr::transmute(
+      SYMBOL   = as.character(target_symbol),
+      ENTREZID = as.character(target_entrez)
+    )
+  
+  # backfill SYMBOL <- ENTREZID where needed
+  need_sym    <- which((is.na(df$SYMBOL)   | df$SYMBOL   == "") &
+                         (!is.na(df$ENTREZID) & df$ENTREZID != ""))
+  if (length(need_sym)) {
+    ent_keys <- unique(df$ENTREZID[need_sym])
+    map_e2s  <- safe_select(org.Mm.eg.db, ent_keys, keytype = "ENTREZID", columns = "SYMBOL")
+    if (nrow(map_e2s)) {
+      idx <- match(df$ENTREZID, map_e2s$ENTREZID)
+      fill <- map_e2s$SYMBOL[idx]
+      df$SYMBOL[need_sym] <- ifelse(df$SYMBOL[need_sym] == "" | is.na(df$SYMBOL[need_sym]), fill[need_sym], df$SYMBOL[need_sym])
+    }
+  }
+  
+  # backfill ENTREZID <- SYMBOL where needed
+  need_entrez <- which((is.na(df$ENTREZID) | df$ENTREZID == "") &
+                         (!is.na(df$SYMBOL)   & df$SYMBOL   != ""))
+  if (length(need_entrez)) {
+    sym_keys <- unique(df$SYMBOL[need_entrez])
+    map_s2e  <- safe_select(org.Mm.eg.db, sym_keys, keytype = "SYMBOL", columns = "ENTREZID")
+    if (nrow(map_s2e)) {
+      idx <- match(df$SYMBOL, map_s2e$SYMBOL)
+      fill <- as.character(map_s2e$ENTREZID[idx])
+      df$ENTREZID[need_entrez] <- ifelse(df$ENTREZID[need_entrez] == "" | is.na(df$ENTREZID[need_entrez]),
+                                         fill[need_entrez], df$ENTREZID[need_entrez])
+    }
+  }
+  
+  # final clean
+  df %>%
+    dplyr::filter(!is.na(ENTREZID), ENTREZID != "") %>%
+    dplyr::distinct()
+}
+
+
+# Enrichment from a data.frame with ENTREZ IDs (preferred)
+mm_enrich_from_targets <- function(target_df, db = "GO:BP", q = 0.05) {
+  if (nrow(target_df) == 0) return(data.frame())
+  genes <- unique(target_df$ENTREZID)
+  if (length(genes) < 10) return(data.frame())
+  
+  if (db == "GO:BP") {
+    eg <- clusterProfiler::enrichGO(gene = genes, OrgDb = org.Mm.eg.db, keyType = "ENTREZID",
+                                    ont = "BP", universe = AnnotationDbi::keys(org.Mm.eg.db, "ENTREZID"),
+                                    pAdjustMethod = "BH", qvalueCutoff = q, readable = TRUE)
+    df <- as.data.frame(eg); if (!nrow(df)) return(data.frame())
+    out <- data.frame(Term = df$Description, Adjusted.P.value = df$p.adjust,
+                      Combined.Score = -log10(df$p.adjust), stringsAsFactors = FALSE)
+    return(out[order(out$Adjusted.P.value), ])
+  }
+  
+  if (db == "KEGG") {
+    kk <- clusterProfiler::enrichKEGG(gene = genes, organism = "mmu",
+                                      pAdjustMethod = "BH", qvalueCutoff = q)
+    kk <- tryCatch(clusterProfiler::setReadable(kk, OrgDb = org.Mm.eg.db, keyType = "ENTREZID"),
+                   error = function(e) kk)
+    df <- as.data.frame(kk); if (!nrow(df)) return(data.frame())
+    out <- data.frame(Term = df$Description, Adjusted.P.value = df$p.adjust,
+                      Combined.Score = -log10(df$p.adjust), stringsAsFactors = FALSE)
+    return(out[order(out$Adjusted.P.value), ])
+  }
+  
+  # REAC / WP via g:Profiler
+  gp <- try(gprofiler2::gost(query = genes, organism = "mmusculus",
+                             sources = db, correction_method = "g_SCS"), silent = TRUE)
+  if (!inherits(gp, "try-error") && !is.null(gp$result) && nrow(gp$result) > 0) {
+    df <- gp$result
+    comb <- -log10(df$p_value) * (df$intersection_size / df$term_size)
+    out <- data.frame(Term = df$term_name, Adjusted.P.value = df$p_value,
+                      Combined.Score = comb, stringsAsFactors = FALSE)
+    return(out[order(out$Adjusted.P.value), ])
+  }
+  data.frame()
+}
+
+# ===================== Generic target retrieval (kept but no miRNAtap) =====================
 get_targets <- function(mirnas, species) {
   mirnas <- unique(na.omit(mirnas))
-  if (length(mirnas) < 1) return(data.frame(mirna=character(), target=character()))
-  
+  if (length(mirnas) < 1)
+    return(data.frame(mirna=character(), target=character(),
+                      evidence=character(), source=character()))
   out <- list()
+  mm_org <- MM_ORG[[species]] %||% NA_character_
   
-  # 1) Validated (multiMiR) for human/mouse
-  if (species %in% c("hs","mm") && MM_ORG[[species]] %in% c("hsa","mmu")) {
-    mm <- try(multiMiR::get_multimir(
-      org   = MM_ORG[[species]],
-      mirna = mirnas,
-      table = "validated",
-      summary = FALSE
+  safe_multimir <- function(org, mirnas, table) {
+    try(R.utils::withTimeout(
+      multiMiR::get_multimir(org = org, mirna = mirnas, table = table, summary = FALSE),
+      timeout = 25, onTimeout = "error"
     ), silent = TRUE)
-    if (!inherits(mm, "try-error") && !is.null(mm) && nrow(mm@data) > 0) {
-      df <- as.data.frame(mm@data)
-      df <- df[, c("mature_mirna_id","target_symbol","database"), drop=FALSE]
-      names(df) <- c("mirna","target","source")
-      df$evidence <- "validated"
+  }
+  
+  if (!is.na(mm_org) && mm_org %in% c("hsa","mmu")) {
+    mm_val <- safe_multimir(mm_org, mirnas, "validated")
+    if (!inherits(mm_val, "try-error") && !is.null(mm_val) && nrow(mm_val@data) > 0) {
+      df <- as.data.frame(mm_val@data)[, c("mature_mirna_id","target_symbol","database"), drop = FALSE]
+      names(df) <- c("mirna","target","source"); df$evidence <- "validated"
       out$validated <- df[, c("mirna","target","evidence","source")]
     }
-  }
-  
-  # 2) Predicted (miRNAtap) for all 4 species
-  if (!is.null(TAP_TAX[[species]])) {
-    tx <- TAP_TAX[[species]]
-    for (mi in mirnas) {
-      pr <- try(miRNAtap::getPredictedTargets(
-        miRNA   = mi,
-        species = tx,
-        method  = c("targetscan","pictar","diana","mirdb","mirmap"),
-        min_src = 2
-      ), silent = TRUE)
-      if (!inherits(pr, "try-error") && is.data.frame(pr) && nrow(pr) > 0) {
-        out[[paste0("pred_", mi)]] <- data.frame(
-          mirna = mi,
-          target = rownames(pr),
-          evidence = "predicted",
-          source = "miRNAtap",
-          row.names = NULL
-        )
-      }
+    mm_pred <- safe_multimir(mm_org, mirnas, "predicted")
+    if (!inherits(mm_pred, "try-error") && !is.null(mm_pred) && nrow(mm_pred@data) > 0) {
+      df <- as.data.frame(mm_pred@data)[, c("mature_mirna_id","target_symbol","database"), drop = FALSE]
+      names(df) <- c("mirna","target","source"); df$evidence <- "predicted"
+      out$predicted <- df[, c("mirna","target","evidence","source")]
     }
   }
   
-  # 3) CSV fallback (always available)
   csv_df <- get_targets_from_csv(mirnas)
   if (nrow(csv_df) > 0) {
-    csv_df$evidence <- "csv"
-    csv_df$source <- "csv"
+    csv_df$evidence <- "csv"; csv_df$source <- "csv"
     out$csv <- csv_df[, c("mirna","target","evidence","source")]
   }
   
-  if (length(out) == 0) return(data.frame(mirna=character(), target=character()))
+  if (length(out) == 0)
+    return(data.frame(mirna=character(), target=character(),
+                      evidence=character(), source=character()))
+  
   ans <- do.call(rbind, out)
   ans <- ans[!duplicated(ans[, c("mirna","target","evidence")]), ]
   rownames(ans) <- NULL
@@ -114,61 +431,27 @@ enrichr_human_choices <- c(
   "WikiPathway_2021_Human"
 )
 gprof_sources <- c("GO:BP","KEGG","REAC","WP")
+db_choices_for_species <- function(sp) if (sp == "hs") enrichr_human_choices else gprof_sources
 
-db_choices_for_species <- function(sp) {
-  if (sp == "hs") enrichr_human_choices else gprof_sources
-}
-
-# ---- Enrichment runners ----
+# ---- Cross-species enrichment runner (kept) ----
 enrich_species <- function(genes, db, species) {
   genes <- unique(na.omit(genes)); genes <- genes[genes != ""]
   if (length(genes) < 2) return(data.frame())
-  
-  # Human → Enrichr
   if (species == "hs" && db %in% enrichr_human_choices) {
     ee <- try(enrichR::enrichr(genes, databases = db), silent = TRUE)
-    if (!inherits(ee, "try-error") && !is.null(ee[[db]]) && nrow(ee[[db]]) > 0) {
-      return(ee[[db]])
-    }
-    # if Enrichr failed, fall through to g:Profiler human sources
-    species <- "hs"  # keep org
-    db <- switch(db,
-                 "GO_Biological_Process_2021" = "GO:BP",
-                 "GO_Molecular_Function_2021" = "GO:MF",
-                 "GO_Cellular_Component_2021" = "GO:CC",
-                 "KEGG_2021_Human"            = "KEGG",
-                 "Reactome_2022"              = "REAC",
-                 "WikiPathway_2021_Human"     = "WP",
-                 "GO:BP"
-    )
+    if (!inherits(ee, "try-error") && !is.null(ee[[db]]) && nrow(ee[[db]]) > 0) return(ee[[db]])
+    db <- switch(db, "GO_Biological_Process_2021"="GO:BP", "GO_Molecular_Function_2021"="GO:MF",
+                 "GO_Cellular_Component_2021"="GO:CC", "KEGG_2021_Human"="KEGG",
+                 "Reactome_2022"="REAC", "WikiPathway_2021_Human"="WP", "GO:BP")
   }
-  
-  # All species → g:Profiler
-  org <- switch(species,
-                hs = "hsapiens",
-                mm = "mmusculus",
-                dr = "drerio",
-                dm = "dmelanogaster",
-                "hsapiens"
-  )
-  src <- db
-  gp <- try(gprofiler2::gost(query = genes, organism = org,
-                             sources = src, correction_method = "g_SCS"),
-            silent = TRUE)
+  org <- switch(species, hs="hsapiens", mm="mmusculus", dr="drerio", dm="dmelanogaster", "hsapiens")
+  gp <- try(gprofiler2::gost(query = genes, organism = org, sources = db, correction_method = "g_SCS"), silent = TRUE)
   if (!inherits(gp, "try-error") && !is.null(gp$result) && nrow(gp$result) > 0) {
-    df <- gp$result
-    # harmonize shape to look like Enrichr
-    comb <- -log10(df$p_value) * (df$intersection_size / df$term_size)
-    out <- data.frame(
-      Term = df$term_name,
-      Adjusted.P.value = df$p_value,
-      Combined.Score = comb,
-      stringsAsFactors = FALSE
-    )
-    out[order(out$Adjusted.P.value), ]
-  } else {
-    data.frame()
+    df <- gp$result; comb <- -log10(df$p_value) * (df$intersection_size / df$term_size)
+    out <- data.frame(Term = df$term_name, Adjusted.P.value = df$p_value, Combined.Score = comb, stringsAsFactors = FALSE)
+    return(out[order(out$Adjusted.P.value), ])
   }
+  data.frame()
 }
 
 # ---- Plot/table helpers (kept) ----
@@ -187,15 +470,12 @@ renderEnrichPlot <- function(df) {
 }
 renderEnrichTable <- function(df) {
   if (is.null(df) || nrow(df) == 0) return(data.frame(Message="No enrichment results"))
-  d <- as.data.frame(df)
-  # try to standardize names
-  nm <- tolower(gsub("\\.","_",names(d)))
+  d <- as.data.frame(df); nm <- tolower(gsub("\\.","_",names(d)))
   ap <- which(nm %in% c("adjusted_p_value","adjusted.p.value","p_value","padj"))[1]
   tm <- which(nm %in% c("term","description","term_name"))[1]
   if (!is.na(ap)) names(d)[ap] <- "Adjusted_P_value"
   if (!is.na(tm)) names(d)[tm] <- "Term"
-  keep <- c("Term","Adjusted_P_value")
-  keep <- keep[keep %in% names(d)]
+  keep <- c("Term","Adjusted_P_value"); keep <- keep[keep %in% names(d)]
   d <- d[, keep, drop=FALSE]
   if ("Adjusted_P_value" %in% names(d)) d$Adjusted_P_value <- signif(d$Adjusted_P_value,4)
   d
@@ -278,123 +558,271 @@ server <- function(input, output, session) {
   enrichAll <- reactiveVal(NULL); enrichUp <- reactiveVal(NULL); enrichDown <- reactiveVal(NULL)
   rf_preds <- reactiveVal(NULL); rf_metrics <- reactiveVal(NULL); rf_importance <- reactiveVal(NULL)
   
-  
-  
-  # ---- Caching for multiMiR / miRNAtap results ----
   target_cache <- reactiveValues()
-  
   cached_get_targets <- function(mirnas, species) {
-    # Build reproducible key
     key <- paste0(species, "_", digest::digest(sort(mirnas)))
-    # Use cache if exists
-    if (!is.null(target_cache[[key]])) {
-      message("✅ Using cached targets for ", species, " (", length(mirnas), " miRNAs)")
-      return(target_cache[[key]])
-    }
-    # Otherwise run and store
-    tg <- get_targets(mirnas, species)
-    target_cache[[key]] <- tg
-    tg
+    if (!is.null(target_cache[[key]])) return(target_cache[[key]])
+    tg <- get_targets(mirnas, species); target_cache[[key]] <- tg; tg
   }
   
-  
-  # ----- DB menu reacts to species -----
   output$db_picker <- renderUI({
     sp <- input$species
     choices <- db_choices_for_species(if (sp %in% c("hs","mm","dr","dm")) sp else "hs")
     selectInput("selectedDB", "Pathway Database", choices = choices, selected = choices[[1]])
   })
   
-  # ====== Run DE + RF ranking ======
   observeEvent(input$runAnalysis, {
     req(input$countsFile, input$metaFile)
     showNotification("🧬 DESeq2 running…", type = "message")
     
-    count_data <- read_csv(input$countsFile$datapath, show_col_types = FALSE)
-    count_matrix <- as.matrix(count_data[,-1]); rownames(count_matrix) <- count_data[[1]]
+    count_data <- readr::read_csv(input$countsFile$datapath, show_col_types = FALSE)
+    if (ncol(count_data) < 2) { showNotification("Counts file must have ≥2 columns.", type="error"); return(NULL) }
+    first_col_counts <- names(count_data)[1]
+    count_matrix <- as.matrix(count_data[, -1, drop = FALSE])
+    rownames(count_matrix) <- count_data[[first_col_counts]]
     
-    meta_data <- read_csv(input$metaFile$datapath, show_col_types = FALSE)
-    meta_data <- as.data.frame(meta_data)
-    rownames(meta_data) <- meta_data[[1]]; meta_data <- meta_data[,-1, drop=FALSE]
-    meta_data$condition <- as.factor(meta_data[[ncol(meta_data)]])
-    meta_data <- meta_data[colnames(count_matrix), , drop = FALSE]
+    meta_data <- readr::read_csv(input$metaFile$datapath, show_col_types = FALSE) |> as.data.frame()
+    if (!("sample_id" %in% names(meta_data))) { showNotification("Metadata must have a 'sample_id' column.", type="error"); return(NULL) }
+    if (!("group" %in% names(meta_data)))     { showNotification("Metadata must have a 'group' column.", type="error"); return(NULL) }
+    rownames(meta_data) <- meta_data$sample_id
     
-    dds <- DESeqDataSetFromMatrix(countData = count_matrix, colData = meta_data, design = ~ condition)
-    dds <- DESeq(dds); ddsData(dds)
-    vsd <- varianceStabilizingTransformation(dds, blind = TRUE); vsdData(vsd)
+    common <- intersect(colnames(count_matrix), rownames(meta_data))
+    if (length(common) < 4) { showNotification("Need ≥4 overlapping samples.", type="error"); return(NULL) }
+    count_matrix <- count_matrix[, common, drop = FALSE]
+    meta_data    <- meta_data[common, , drop = FALSE]
     
-    res <- results(dds); res$miRNA <- rownames(res)
-    res_df <- as.data.frame(res) %>% mutate(sig = !is.na(padj) & padj < 0.1)
-    # RF ranking on top 20 by padj
-    top20 <- res_df %>% arrange(padj) %>% filter(!is.na(padj)) %>% slice_head(n=20)
-    vst <- assay(vsd)
-    vst_ren <- vst; rownames(vst_ren) <- make.names(rownames(vst))
-    top20$miRNA_clean <- make.names(top20$miRNA)
-    sub <- vst_ren[rownames(vst_ren) %in% top20$miRNA_clean, , drop=FALSE]
-    df_rf <- as.data.frame(t(sub)); df_rf$condition <- factor(colData(vsd)$condition)
-    rf <- randomForest(condition ~ ., data = df_rf, importance = TRUE)
-    imp <- importance(rf, type = 2); imp_df <- data.frame(miRNA_clean = rownames(imp), Importance = imp[,1]) %>%
-      arrange(desc(Importance)) %>% slice_head(n=11)
-    map <- data.frame(miRNA = top20$miRNA, miRNA_clean = top20$miRNA_clean)
-    imp_df <- merge(imp_df, map, by="miRNA_clean", all.x = TRUE)
-    final_hits <- res_df %>% filter(miRNA %in% imp_df$miRNA)
-    if (!nrow(final_hits)) { showNotification("No RF-ranked hits.", type="error"); return(NULL) }
-    resultsDF(final_hits)
+    meta_data$condition <- factor(meta_data$group, levels = c("Control","LPS"))
+    use_batch <- "batch" %in% names(meta_data) && nlevels(factor(meta_data$batch)) > 1
+    if (use_batch) meta_data$batch <- factor(meta_data$batch)
     
-    showNotification("✅ DE + RF complete", type="message")
+    reps <- table(meta_data$condition)
+    if (any(reps < 2)) { showNotification(paste("Need ≥2 replicates per group. Found:", paste(names(reps), reps, collapse=" / ")), type="error"); return(NULL) }
+    design_formula <- if (use_batch) ~ batch + condition else ~ condition
     
-    # If species is auto, infer now and refresh DB menu
-    if (input$species == "auto") {
-      sp <- detect_species(final_hits$miRNA, fallback = "hs")
-      updateSelectInput(session, "species", selected = sp)
-      updateSelectInput(session, "selectedDB", choices = db_choices_for_species(sp))
+    # ---------- DESeq2 (robust with dispersion fallbacks) ----------
+    dds <- DESeqDataSetFromMatrix(countData = round(count_matrix),
+                                  colData   = meta_data,
+                                  design    = design_formula)
+    dds <- dds[rowSums(counts(dds)) > 0, ]
+    
+    # Full-rank check (avoid “coefficients == samples”)
+    X <- model.matrix(design(dds), data = as.data.frame(colData(dds)))
+    if (qr(X)$rank == nrow(X)) {
+      showNotification("Design is full rank (coefficients == samples). Simplify (drop batch).", type = "error")
+      return(NULL)
     }
+    
+    # ---- Try standard pipeline, then local/mean, then gene-wise fallback ----
+    run_deseq2_res <- function(dds) {
+      # 1) Try default (parametric fit)
+      res <- try({
+        dds1 <- DESeq(dds, fitType = "parametric", minReplicatesForReplace = Inf)
+        list(dds = dds1, method = "parametric")
+      }, silent = TRUE)
+      if (!inherits(res, "try-error")) return(res)
+      
+      # 2) Try local fit
+      res <- try({
+        dds2 <- DESeq(dds, fitType = "local", minReplicatesForReplace = Inf)
+        list(dds = dds2, method = "local")
+      }, silent = TRUE)
+      if (!inherits(res, "try-error")) return(res)
+      
+      # 3) Try mean fit
+      res <- try({
+        dds3 <- DESeq(dds, fitType = "mean", minReplicatesForReplace = Inf)
+        list(dds = dds3, method = "mean")
+      }, silent = TRUE)
+      if (!inherits(res, "try-error")) return(res)
+      
+      # 4) Final fallback: use gene-wise dispersions, then Wald test
+      # (matches the message printed by DESeq2)
+      message("⚠️ Falling back to gene-wise dispersions -> nbinomWaldTest")
+      dds4 <- estimateSizeFactors(dds)
+      dds4 <- estimateDispersionsGeneEst(dds4)
+      dispersions(dds4) <- mcols(dds4)$dispGeneEst
+      dds4 <- nbinomWaldTest(dds4)
+      list(dds = dds4, method = "gene-wise")
+    }
+    
+    fit <- run_deseq2_res(dds)
+    dds <- fit$dds
+    showNotification(paste("DESeq2 dispersion fit:", fit$method), type = "message", duration = 4)
+    
+    # ----- Build results object (robustly find contrast) -----
+    rn <- resultsNames(dds)  # e.g., "Intercept", "condition_LPS_vs_Control"
+    coef_name <- rn[grepl("^condition_.*_vs_.*$", rn)]
+    
+    res <- try({
+      if (length(coef_name) == 1 && requireNamespace("apeglm", quietly = TRUE) && fit$method != "gene-wise") {
+        lfcShrink(dds, coef = coef_name, type = "apeglm")
+      } else if (length(coef_name) == 1) {
+        results(dds, name = coef_name)
+      } else {
+        results(dds, contrast = c("condition", "LPS", "Control"))
+      }
+    }, silent = TRUE)
+    
+    if (inherits(res, "try-error")) {
+      # If lfcShrink fails on fallback fits, use plain results
+      res <- results(dds, contrast = c("condition", "LPS", "Control"))
+    }
+    
+    res_df <- as.data.frame(res) %>%
+      tibble::rownames_to_column("miRNA") %>%
+      dplyr::mutate(sig = !is.na(padj) & padj < 0.1)
+    
+    # ---------- RandomForest ranking on top-20 by padj (unchanged) ----------
+    top20 <- res_df %>%
+      dplyr::filter(!is.na(padj)) %>%
+      dplyr::arrange(padj) %>%
+      dplyr::slice_head(n = 20)
+    
+    if (nrow(top20) < 2) {
+      showNotification("Not enough DE features to rank.", type = "message"); return(NULL)
+    }
+    
+    vsd <- varianceStabilizingTransformation(dds, blind = TRUE)
+    vst <- assay(vsd)
+    
+    # Harmonize names for safe column handling
+    vst_ren <- vst
+    rownames(vst_ren) <- make.names(rownames(vst))
+    top20$miRNA_clean <- make.names(top20$miRNA)
+    
+    sub <- vst_ren[rownames(vst_ren) %in% top20$miRNA_clean, , drop = FALSE]
+    if (nrow(sub) < 2) {
+      showNotification("Top DE features not found in VST matrix.", type = "error"); return(NULL)
+    }
+    
+    df_rf <- as.data.frame(t(sub))
+    df_rf$condition <- colData(vsd)$condition
+    
+    set.seed(1)
+    rf <- randomForest::randomForest(condition ~ ., data = df_rf, importance = TRUE)
+    imp <- randomForest::importance(rf, type = 2)
+    imp_df <- data.frame(miRNA_clean = rownames(imp), Importance = imp[, 1]) %>%
+      dplyr::arrange(dplyr::desc(Importance)) %>%
+      dplyr::slice_head(n = 11)
+    
+    map <- data.frame(miRNA = top20$miRNA, miRNA_clean = top20$miRNA_clean)
+    imp_df <- merge(imp_df, map, by = "miRNA_clean", all.x = TRUE)
+    
+    final_hits <- res_df %>% dplyr::filter(miRNA %in% imp_df$miRNA)
+    if (!nrow(final_hits)) {
+      showNotification("No RF-ranked hits.", type = "error"); return(NULL)
+    }
+    
+    resultsDF(final_hits)
+    ddsData(dds)
+    vsdData(vsd)
+    showNotification("✅ DE + RF complete", type = "message")
   })
+  # ====== Enrichment (robust) ======
+  # ===================== Enrichment server block (INSIDE server) =====================
   
-  # ====== Enrichment wrappers (All/Up/Down) ======
+  # Species picker reactive (already in your app; keep here if you want local)
   get_species_current <- reactive({
     sp <- input$species
     if (sp == "auto" && !is.null(resultsDF())) detect_species(resultsDF()$miRNA, "hs") else sp
   })
   
-  do_enrich <- function(which_set=c("all","up","down")) {
+  do_enrich <- function(which_set = c("all","up","down")) {
     req(resultsDF())
     df <- resultsDF()
     which_set <- match.arg(which_set)
-    if (which_set == "all") {
-      mirnas <- df$miRNA
-    } else if (which_set == "up") {
-      mirnas <- df %>% filter(!is.na(padj), padj < 0.1, log2FoldChange > 0) %>% pull(miRNA)
-    } else {
-      mirnas <- df %>% filter(!is.na(padj), padj < 0.1, log2FoldChange < 0) %>% pull(miRNA)
-    }
-    if (length(mirnas) < 1) return(data.frame())
     
-    sp <- get_species_current()
-    tg <- cached_get_targets(mirnas, species = sp)   # <---- cached version here!
-    genes <- unique(tg$target)
+    mirnas <- switch(
+      which_set,
+      all  = df$miRNA,
+      up   = df %>% dplyr::filter(!is.na(padj), padj < 0.1, log2FoldChange > 0) %>% dplyr::pull(miRNA),
+      down = df %>% dplyr::filter(!is.na(padj), padj < 0.1, log2FoldChange < 0) %>% dplyr::pull(miRNA)
+    )
+    mirnas <- unique(stats::na.omit(mirnas))
+    if (!length(mirnas)) return(data.frame())
+    
+    sp <- tryCatch(tolower(as.character(get_species_current())), error = function(e) "hs")
+    if (length(sp) != 1 || is.na(sp) || sp == "") sp <- "hs"
+    
+    if (sp %in% c("mm","mouse","mmu")) {
+      showNotification("Fetching mouse targets (multiMiR)…", type="message", duration=3)
+      tg_df <- try(mm_targets_df(mirnas), silent = TRUE)
+      if (inherits(tg_df,"try-error") || !is.data.frame(tg_df) || !nrow(tg_df)) {
+        showNotification("No mouse targets returned.", type="error"); return(data.frame())
+      }
+      showNotification(paste("Targets found:", nrow(tg_df)), type="message", duration=3)
+      ans <- try(mm_enrich_from_targets(tg_df, db = input$selectedDB, q = 0.05), silent = TRUE)
+      return(if (inherits(ans,"try-error") || is.null(ans)) data.frame() else ans)
+    }
+    
+    if (sp %in% c("dr","dre","zebrafish")) {
+      showNotification("Fetching zebrafish targets (orthology)…", type="message", duration=3)
+      tg_df <- try(dr_targets_df(mirnas), silent = TRUE)
+      if (inherits(tg_df,"try-error") || !is.data.frame(tg_df) || !nrow(tg_df)) {
+        showNotification("No zebrafish targets returned.", type="error"); return(data.frame())
+      }
+      showNotification(paste("Targets found:", nrow(tg_df)), type="message", duration=3)
+      ans <- try(dr_enrich_from_targets(tg_df, db = input$selectedDB, q = 0.05), silent = TRUE)
+      return(if (inherits(ans,"try-error") || is.null(ans)) data.frame() else ans)
+    }
+    
+    if (sp %in% c("dm","dme","fly")) {
+      showNotification("Fetching fly targets (orthology)…", type="message", duration=3)
+      tg_df <- try(dm_targets_df(mirnas), silent = TRUE)
+      if (inherits(tg_df,"try-error") || !is.data.frame(tg_df) || !nrow(tg_df)) {
+        showNotification("No fly targets returned.", type="error"); return(data.frame())
+      }
+      showNotification(paste("Targets found:", nrow(tg_df)), type="message", duration=3)
+      ans <- try(dm_enrich_from_targets(tg_df, db = input$selectedDB, q = 0.05), silent = TRUE)
+      return(if (inherits(ans,"try-error") || is.null(ans)) data.frame() else ans)
+    }
+    
+    # Default (human/other): use your cached_get_targets → enrich_species
+    tg <- try(cached_get_targets(mirnas, species = sp), silent = TRUE)
+    if (inherits(tg,"try-error") || is.null(tg) || !is.data.frame(tg) || !"target" %in% names(tg)) return(data.frame())
+    genes <- unique(stats::na.omit(tg$target))
     if (length(genes) < 2) return(data.frame())
     
-    enrich_species(genes, input$selectedDB, sp)
+    if (sp %in% c("hs","hsa","human") && input$selectedDB %in% enrichr_human_choices) {
+      ee <- .enrichr_pull(genes, input$selectedDB)
+      if (nrow(ee)) return(ee)
+      db_gp <- switch(input$selectedDB,
+                      "GO_Biological_Process_2021" = "GO:BP",
+                      "GO_Molecular_Function_2021" = "GO:MF",
+                      "GO_Cellular_Component_2021" = "GO:CC",
+                      "KEGG_2021_Human"            = "KEGG",
+                      "Reactome_2022"              = "REAC",
+                      "WikiPathway_2021_Human"     = "WP",
+                      "GO:BP"
+      )
+      return(enrich_species(genes, db_gp, "hs"))
+    } else {
+      return(enrich_species(genes, input$selectedDB, sp))
+    }
   }
   
-  observeEvent(input$enrichAllBtn,  { showNotification("Enrichment: all DE",  type="message"); enrichAll(do_enrich("all")) })
-  observeEvent(input$enrichUpBtn,   { showNotification("Enrichment: up",      type="message"); enrichUp(do_enrich("up")) })
+  # Buttons → compute + store in reactiveVals you already created (enrichAll/Up/Down)
+  observeEvent(input$enrichAllBtn,  { showNotification("Enrichment: all DE",  type="message"); enrichAll(do_enrich("all"))  })
+  observeEvent(input$enrichUpBtn,   { showNotification("Enrichment: up",      type="message"); enrichUp(do_enrich("up"))   })
   observeEvent(input$enrichDownBtn, { showNotification("Enrichment: down",    type="message"); enrichDown(do_enrich("down")) })
   
-  output$enrichAllTable  <- renderTable({ renderEnrichTable(enrichAll()) })
-  output$enrichUpTable   <- renderTable({ renderEnrichTable(enrichUp()) })
+  # Tables (uses your existing renderEnrichTable helper)
+  output$enrichAllTable  <- renderTable({ renderEnrichTable(enrichAll())  })
+  output$enrichUpTable   <- renderTable({ renderEnrichTable(enrichUp())   })
   output$enrichDownTable <- renderTable({ renderEnrichTable(enrichDown()) })
   
-  output$downloadEnrichAll  <- downloadHandler(filename=function(){ "enrichment_all.csv"  }, content=function(f){ write.csv(enrichAll(), f, row.names=FALSE) })
-  output$downloadEnrichUp   <- downloadHandler(filename=function(){ "enrichment_up.csv"   }, content=function(f){ write.csv(enrichUp(), f, row.names=FALSE) })
+  # Downloads
+  output$downloadEnrichAll  <- downloadHandler(filename=function(){ "enrichment_all.csv"  }, content=function(f){ write.csv(enrichAll(),  f, row.names=FALSE) })
+  output$downloadEnrichUp   <- downloadHandler(filename=function(){ "enrichment_up.csv"   }, content=function(f){ write.csv(enrichUp(),   f, row.names=FALSE) })
   output$downloadEnrichDown <- downloadHandler(filename=function(){ "enrichment_down.csv" }, content=function(f){ write.csv(enrichDown(), f, row.names=FALSE) })
   
-  observeEvent(input$plotEnrichAllBtn,  { req(enrichAll());  output$enrichAllPlot  <- renderPlotly(renderEnrichPlot(enrichAll())) })
-  observeEvent(input$plotEnrichUpBtn,   { req(enrichUp());   output$enrichUpPlot   <- renderPlotly(renderEnrichPlot(enrichUp())) })
-  observeEvent(input$plotEnrichDownBtn, { req(enrichDown()); output$enrichDownPlot <- renderPlotly(renderEnrichPlot(enrichDown())) })
+  # Barplots (uses your existing renderEnrichPlot helper)
+  observeEvent(input$plotEnrichAllBtn,  { req(enrichAll());  output$enrichAllPlot  <- renderPlotly(renderEnrichPlot(enrichAll()))  })
+  observeEvent(input$plotEnrichUpBtn,   { req(enrichUp());   output$enrichUpPlot   <- renderPlotly(renderEnrichPlot(enrichUp()))   })
+  observeEvent(input$plotEnrichDownBtn, { req(enrichDown()); output$enrichDownPlot <- renderPlotly(renderEnrichPlot(enrichDown())) }) 
   
-  # ====== Heatmap / PCA / UMAP / Volcano / Barplot (unchanged) ======
+
+  # ====== Plots (kept) ======
   output$topTable <- renderTable({
     req(resultsDF()); df <- resultsDF()
     df <- df[order(df$padj), ]; df <- head(df, 20)
@@ -450,7 +878,7 @@ server <- function(input, output, session) {
     })
   })
   
-  # ====== Random Forest (unchanged, simplified metrics) ======
+  # ====== Random Forest (kept) ======
   observeEvent(input$runRF, {
     req(resultsDF(), vsdData())
     vst <- assay(vsdData()); sig <- resultsDF()$miRNA
@@ -484,7 +912,7 @@ server <- function(input, output, session) {
   output$downloadRFimportance <- downloadHandler(filename=function(){paste0("rf_importance_",Sys.Date(),".csv")},
                                                  content=function(f){ write.csv(rf_importance(), f, row.names=FALSE) })
   
-  # ====== Power analysis (kept) ======
+  # ====== Power (kept) ======
   observeEvent(input$runPower, {
     req(vsdData()); vst <- assay(vsdData()); cond <- factor(vsdData()$condition)
     g1 <- which(cond == levels(cond)[1]); g2 <- which(cond == levels(cond)[2])
@@ -506,10 +934,10 @@ server <- function(input, output, session) {
     abline(h = median(na.omit(mins)), col="red", lty=2)
   })
   
-  # README
   output$readmeText <- renderPrint({ if (file.exists("readme.txt")) cat(readLines("readme.txt"), sep="\n") else cat("README not found.") })
 }
 
 shinyApp(ui, server)
 
-
+  
+  
