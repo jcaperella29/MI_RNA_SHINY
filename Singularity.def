@@ -91,4 +91,3 @@ From: rocker/shiny:latest
     cd $APPDIR
     # Prevent the 'Shiny Server v0.3.4' confusion by unsetting the variable:
     exec R -e "Sys.unsetenv('SHINY_SERVER_VERSION'); options(shiny.host='0.0.0.0', shiny.port=3838); shiny::runApp('/app', launch.browser=FALSE)"
-
