@@ -63,6 +63,52 @@ safe_select <- function(orgdb, keys, keytype, columns) {
   dplyr::distinct(as.data.frame(out))
 }
 
+# ---- Attach per-term gene & miRNA lists ----
+add_gene_mirna_cols <- function(df, genes_col, id_type = c("symbol", "entrez"),
+                                target_df, symbol_col = "SYMBOL", entrez_col = "ENTREZID",
+                                mirna_col = "miRNA") {
+  id_type <- match.arg(id_type)
+  if (is.null(df) || !nrow(df) || is.null(target_df) || !nrow(target_df)) return(df)
+  if (!genes_col %in% colnames(df)) return(df)
+  if (!mirna_col %in% colnames(target_df)) return(df)
+
+  # Normalise column names in target_df
+  td <- as.data.frame(target_df)
+  if (!symbol_col %in% names(td))  td[[symbol_col]]  <- NA_character_
+  if (!entrez_col %in% names(td))  td[[entrez_col]]  <- NA_character_
+  names(td)[names(td) == mirna_col] <- "miRNA"
+  names(td)[names(td) == symbol_col] <- "SYMBOL"
+  names(td)[names(td) == entrez_col] <- "ENTREZID"
+
+  df$Genes  <- NA_character_
+  df$miRNAs <- NA_character_
+
+  for (i in seq_len(nrow(df))) {
+    raw <- as.character(df[[genes_col]][i])
+    if (is.na(raw) || raw == "") next
+
+    # Enrichr uses ";", g:Profiler "/", clusterProfiler "/"
+    g_ids <- unlist(strsplit(raw, "[,;/]"))
+    g_ids <- g_ids[g_ids != ""]
+
+    if (!length(g_ids)) next
+
+    if (id_type == "symbol") {
+      hit <- td[td$SYMBOL %in% g_ids | td$target %in% g_ids, , drop = FALSE]
+      genes <- unique(c(hit$SYMBOL, hit$target))
+    } else {
+      hit <- td[td$ENTREZID %in% g_ids, , drop = FALSE]
+      # Prefer SYMBOL if available, else ENTREZID
+      genes <- unique(ifelse(is.na(hit$SYMBOL) | hit$SYMBOL == "",
+                             hit$ENTREZID, hit$SYMBOL))
+    }
+
+    df$Genes[i]  <- if (length(genes))  paste(genes, collapse = "; ")  else NA_character_
+    df$miRNAs[i] <- if (nrow(hit))      paste(unique(hit$miRNA), collapse = "; ") else NA_character_
+  }
+  df
+}
+
 # -- Enrichr/g:Profiler DB menus by species
 enrichr_human_choices <- c(
   "GO_Biological_Process_2021",
@@ -84,56 +130,170 @@ db_choices_for_species <- function(sp) if (sp == "hs") enrichr_human_choices els
   out
 }
 
-# ---------------------- Mouse (mmu): multiMiR → clusterProfiler ----------------------
 mm_targets_df <- function(mirnas) {
+  # mirnas = vector of mmu-miR-* IDs
   safe_mm <- function(org, mirs, table) {
     try(R.utils::withTimeout(
       multiMiR::get_multimir(org = org, mirna = mirs, table = table, summary = FALSE),
       timeout = 25, onTimeout = "error"
     ), silent = TRUE)
   }
+
   v <- safe_mm("mmu", mirnas, "validated")
   p <- safe_mm("mmu", mirnas, "predicted")
+
   dat <- dplyr::bind_rows(
     if (!inherits(v,"try-error") && !is.null(v) && nrow(v@data)) tibble::as_tibble(v@data) else NULL,
     if (!inherits(p,"try-error") && !is.null(p) && nrow(p@data)) tibble::as_tibble(p@data) else NULL
   )
-  if (!nrow(dat)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
-  df <- dat %>% dplyr::transmute(SYMBOL = as.character(target_symbol),
-                                 ENTREZID = as.character(target_entrez))
-  # backfill SYMBOL ⇄ ENTREZ
-  need_sym <- which((is.na(df$SYMBOL) | df$SYMBOL == "") & (!is.na(df$ENTREZID) & df$ENTREZID != ""))
+  if (!nrow(dat)) {
+    return(tibble::tibble(miRNA   = character(),
+                          SYMBOL   = character(),
+                          ENTREZID = character()))
+  }
+
+  df <- dat %>%
+    dplyr::transmute(
+      miRNA   = as.character(mature_mirna_id),
+      SYMBOL  = as.character(target_symbol),
+      ENTREZID = as.character(target_entrez)
+    )
+
+  # Fill missing SYMBOL from ENTREZID
+  need_sym <- which((is.na(df$SYMBOL) | df$SYMBOL == "") &
+                      (!is.na(df$ENTREZID) & df$ENTREZID != ""))
   if (length(need_sym)) {
-    map <- safe_select(org.Mm.eg.db, unique(df$ENTREZID[need_sym]), "ENTREZID", "SYMBOL")
-    if (nrow(map)) df$SYMBOL[need_sym] <- map$SYMBOL[match(df$ENTREZID[need_sym], map$ENTREZID)]
+    map <- safe_select(org.Mm.eg.db,
+                       unique(df$ENTREZID[need_sym]),
+                       keytype = "ENTREZID",
+                       columns = "SYMBOL")
+    if (nrow(map)) {
+      idx <- match(df$ENTREZID, map$ENTREZID)
+      df$SYMBOL[need_sym] <- ifelse(
+        df$SYMBOL[need_sym] == "" | is.na(df$SYMBOL[need_sym]),
+        map$SYMBOL[idx][need_sym],
+        df$SYMBOL[need_sym]
+      )
+    }
   }
-  need_ent <- which((is.na(df$ENTREZID) | df$ENTREZID == "") & (!is.na(df$SYMBOL) & df$SYMBOL != ""))
+
+  # Fill missing ENTREZID from SYMBOL
+  need_ent <- which((is.na(df$ENTREZID) | df$ENTREZID == "") &
+                      (!is.na(df$SYMBOL) & df$SYMBOL != ""))
   if (length(need_ent)) {
-    map <- safe_select(org.Mm.eg.db, unique(df$SYMBOL[need_ent]), "SYMBOL", "ENTREZID")
-    if (nrow(map)) df$ENTREZID[need_ent] <- as.character(map$ENTREZID[match(df$SYMBOL[need_ent], map$SYMBOL)])
+    map <- safe_select(org.Mm.eg.db,
+                       unique(df$SYMBOL[need_ent]),
+                       keytype = "SYMBOL",
+                       columns = "ENTREZID")
+    if (nrow(map)) {
+      idx <- match(df$SYMBOL, map$SYMBOL)
+      df$ENTREZID[need_ent] <- ifelse(
+        df$ENTREZID[need_ent] == "" | is.na(df$ENTREZID[need_ent]),
+        as.character(map$ENTREZID[idx][need_ent]),
+        df$ENTREZID[need_ent]
+      )
+    }
   }
-  df %>% dplyr::filter(!is.na(ENTREZID), ENTREZID != "") %>% dplyr::distinct()
+
+  df %>%
+    dplyr::filter(!is.na(ENTREZID), ENTREZID != "") %>%
+    dplyr::distinct(miRNA, SYMBOL, ENTREZID)
 }
 
 mm_enrich_from_targets <- function(target_df, db = "GO:BP", q = 0.05) {
+  # target_df: miRNA, SYMBOL, ENTREZID
   if (!is.data.frame(target_df) || !nrow(target_df)) return(data.frame())
-  genes <- unique(target_df$ENTREZID); if (length(genes) < 10) return(data.frame())
+  genes <- unique(target_df$ENTREZID)
+  if (length(genes) < 10) return(data.frame())
+
   if (db == "GO:BP") {
-    eg <- clusterProfiler::enrichGO(genes, OrgDb = org.Mm.eg.db, keyType = "ENTREZID",
-                                    ont = "BP", pAdjustMethod = "BH", qvalueCutoff = q, readable = TRUE)
-    df <- as.data.frame(eg); if (!nrow(df)) return(data.frame())
-    return(df %>% dplyr::transmute(Term = Description,
-                                   Adjusted.P.value = p.adjust,
-                                   Combined.Score = -log10(p.adjust)) %>% dplyr::arrange(Adjusted.P.value))
+    eg <- clusterProfiler::enrichGO(
+      gene          = genes,
+      OrgDb         = org.Mm.eg.db,
+      keyType       = "ENTREZID",
+      ont           = "BP",
+      pAdjustMethod = "BH",
+      qvalueCutoff  = q,
+      readable      = FALSE  # keep ENTREZID so we can map ourselves
+    )
+    df <- as.data.frame(eg)
+    if (!nrow(df)) return(data.frame())
+    df$Combined.Score <- -log10(df$p.adjust)
+    df2 <- df %>%
+      dplyr::transmute(
+        Term              = Description,
+        Adjusted.P.value  = p.adjust,
+        Combined.Score    = Combined.Score,
+        geneID            = geneID  # keep raw ENTREZ list
+      )
+    df2 <- add_gene_mirna_cols(df2,
+                               genes_col = "geneID",
+                               id_type   = "entrez",
+                               target_df = target_df,
+                               symbol_col = "SYMBOL",
+                               entrez_col = "ENTREZID",
+                               mirna_col = "miRNA")
+    return(df2[order(df2$Adjusted.P.value), ])
   }
+
   if (db == "KEGG") {
-    kk <- clusterProfiler::enrichKEGG(genes, organism = "mmu", pAdjustMethod = "BH", qvalueCutoff = q)
-    kk <- tryCatch(clusterProfiler::setReadable(kk, OrgDb = org.Mm.eg.db, keyType = "ENTREZID"), error = function(e) kk)
-    df <- as.data.frame(kk); if (!nrow(df)) return(data.frame())
-    return(df %>% dplyr::transmute(Term = Description,
-                                   Adjusted.P.value = p.adjust,
-                                   Combined.Score = -log10(p.adjust)) %>% dplyr::arrange(Adjusted.P.value))
+    kk <- clusterProfiler::enrichKEGG(
+      gene          = genes,
+      organism      = "mmu",
+      pAdjustMethod = "BH",
+      qvalueCutoff  = q
+    )
+    df <- as.data.frame(kk)
+    if (!nrow(df)) return(data.frame())
+    df$Combined.Score <- -log10(df$p.adjust)
+    df2 <- df %>%
+      dplyr::transmute(
+        Term              = Description,
+        Adjusted.P.value  = p.adjust,
+        Combined.Score    = Combined.Score,
+        geneID            = geneID
+      )
+    df2 <- add_gene_mirna_cols(df2,
+                               genes_col = "geneID",
+                               id_type   = "entrez",
+                               target_df = target_df,
+                               symbol_col = "SYMBOL",
+                               entrez_col = "ENTREZID",
+                               mirna_col = "miRNA")
+    return(df2[order(df2$Adjusted.P.value), ])
   }
+
+  # REAC/WP via g:Profiler
+  gp <- try(gprofiler2::gost(
+    query              = genes,
+    organism           = "mmusculus",
+    sources            = db,
+    correction_method  = "g_SCS"
+  ), silent = TRUE)
+
+  if (!inherits(gp, "try-error") && !is.null(gp$result) && nrow(gp$result) > 0) {
+    df <- gp$result
+    comb <- -log10(df$p_value) * (df$intersection_size / df$term_size)
+    df2 <- data.frame(
+      Term             = df$term_name,
+      Adjusted.P.value = df$p_value,
+      Combined.Score   = comb,
+      intersection     = df$intersection,
+      stringsAsFactors = FALSE
+    )
+    df2 <- add_gene_mirna_cols(df2,
+                               genes_col = "intersection",
+                               id_type   = "entrez",
+                               target_df = target_df,
+                               symbol_col = "SYMBOL",
+                               entrez_col = "ENTREZID",
+                               mirna_col = "miRNA")
+    return(df2[order(df2$Adjusted.P.value), ])
+  }
+
+  data.frame()
+}
+
   gp <- try(gprofiler2::gost(query = genes, organism = "mmusculus", sources = db, correction_method = "g_SCS"), silent = TRUE)
   if (!inherits(gp,"try-error") && !is.null(gp$result) && nrow(gp$result)>0) {
     df <- gp$result; comb <- -log10(df$p_value)*(df$intersection_size/df$term_size)
@@ -144,31 +304,323 @@ mm_enrich_from_targets <- function(target_df, db = "GO:BP", q = 0.05) {
 
 # ---------------------- Zebrafish (dre): human targets → orthology → drerio ----------------------
 .to_hsa_from_dre <- function(mi) sub("^dre-", "hsa-", as.character(mi), ignore.case = TRUE)
+# ---------------------- Zebrafish (dre): human targets → orthology → drerio ----------------------
+
+.to_hsa_from_dre <- function(mi) sub("^dre-", "hsa-", as.character(mi), ignore.case = TRUE)
 
 dr_targets_df <- function(mirnas) {
+  # Convert dre-miR-XXX to hsa-miR-XXX for multiMiR
   hsa_mirs <- unique(stats::na.omit(.to_hsa_from_dre(mirnas)))
-  if (!length(hsa_mirs)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
-  pull_mm <- function(tbl) try(R.utils::withTimeout(
-    multiMiR::get_multimir(org="hsa", mirna=hsa_mirs, table=tbl, summary=FALSE),
-    timeout = 25, onTimeout="error"), silent=TRUE)
-  v <- pull_mm("validated"); p <- pull_mm("predicted")
+  if (!length(hsa_mirs)) {
+    return(data.frame(miRNA = character(),
+                      SYMBOL = character(),
+                      ENTREZID = character(),
+                      stringsAsFactors = FALSE))
+  }
+
+  pull_mm <- function(tbl) {
+    try(R.utils::withTimeout(
+      multiMiR::get_multimir(org = "hsa",
+                             mirna = hsa_mirs,
+                             table = tbl,
+                             summary = FALSE),
+      timeout = 25,
+      onTimeout = "error"
+    ), silent = TRUE)
+  }
+
+  v <- pull_mm("validated")
+  p <- pull_mm("predicted")
+
+  hdat <- dplyr::bind_rows(
+    if (!inherits(v, "try-error") && !is.null(v) && nrow(v@data)) as.data.frame(v@data) else NULL,
+    if (!inherits(p, "try-error") && !is.null(p) && nrow(p@data)) as.data.frame(p@data) else NULL
+  )
+
+  if (!nrow(hdat)) {
+    return(data.frame(miRNA = character(),
+                      SYMBOL = character(),
+                      ENTREZID = character(),
+                      stringsAsFactors = FALSE))
+  }
+
+  # Keep human miRNA + human target symbol
+  hdat_small <- hdat %>%
+    dplyr::transmute(
+      hsa_miRNA    = as.character(mature_mirna_id),
+      human_symbol = as.character(target_symbol)
+    ) %>%
+    dplyr::filter(
+      !is.na(hsa_miRNA), hsa_miRNA != "",
+      !is.na(human_symbol), human_symbol != ""
+    ) %>%
+    dplyr::distinct()
+
+  # Orthology: human_symbol -> zebrafish symbol
+  ortho <- try(
+    gprofiler2::gorth(unique(hdat_small$human_symbol), "hsapiens", "drerio"),
+    silent = TRUE
+  )
+  if (inherits(ortho, "try-error") || is.null(ortho) || !nrow(ortho)) {
+    return(data.frame(miRNA = character(),
+                      SYMBOL = character(),
+                      ENTREZID = character(),
+                      stringsAsFactors = FALSE))
+  }
+
+  # Identify columns for human and zebrafish gene names
+  human_col <- if ("name" %in% colnames(ortho)) {
+    "name"
+  } else if ("input" %in% colnames(ortho)) {
+    "input"
+  } else {
+    colnames(ortho)[1]
+  }
+
+  dr_col <- if ("ortholog_name" %in% colnames(ortho)) {
+    "ortholog_name"
+  } else if ("target_name" %in% colnames(ortho)) {
+    "target_name"
+  } else if ("name" %in% colnames(ortho) && human_col != "name") {
+    "name"
+  } else {
+    colnames(ortho)[2]
+  }
+
+  map_df <- ortho[, c(human_col, dr_col)]
+  colnames(map_df) <- c("human_symbol", "dr_symbol")
+  map_df <- map_df %>%
+    dplyr::filter(!is.na(dr_symbol), dr_symbol != "") %>%
+    dplyr::distinct()
+
+  # Join to get dre genes per miRNA
+  joined <- dplyr::inner_join(hdat_small, map_df, by = "human_symbol")
+  if (!nrow(joined)) {
+    return(data.frame(miRNA = character(),
+                      SYMBOL = character(),
+                      ENTREZID = character(),
+                      stringsAsFactors = FALSE))
+  }
+
+  # Map zebrafish symbols -> ENTREZID
+  ann <- safe_select(org.Dr.eg.db,
+                     unique(joined$dr_symbol),
+                     keytype = "SYMBOL",
+                     columns = "ENTREZID")
+  if (!nrow(ann)) {
+    return(data.frame(miRNA = character(),
+                      SYMBOL = character(),
+                      ENTREZID = character(),
+                      stringsAsFactors = FALSE))
+  }
+
+  out <- dplyr::inner_join(joined, ann, by = c("dr_symbol" = "SYMBOL")) %>%
+    dplyr::transmute(
+      miRNA   = sub("^hsa-", "dre-", hsa_miRNA, ignore.case = TRUE),
+      SYMBOL  = as.character(dr_symbol),
+      ENTREZID = as.character(ENTREZID)
+    ) %>%
+    dplyr::filter(!is.na(ENTREZID), ENTREZID != "") %>%
+    dplyr::distinct()
+
+  out
+}
+
+dr_enrich_from_targets <- function(target_df, db = "GO:BP", q = 0.05) {
+  if (!is.data.frame(target_df) || !nrow(target_df)) return(data.frame())
+
+  # Ensure columns exist
+  if (!"miRNA" %in% names(target_df))  target_df$miRNA  <- NA_character_
+  if (!"SYMBOL" %in% names(target_df)) target_df$SYMBOL <- NA_character_
+
+  genes <- unique(target_df$ENTREZID)
+  genes <- genes[!is.na(genes) & genes != ""]
+  if (length(genes) < 10) return(data.frame())
+
+  base_df <- NULL
+
+  if (db == "GO:BP") {
+    eg <- clusterProfiler::enrichGO(
+      gene          = genes,
+      OrgDb         = org.Dr.eg.db,
+      keyType       = "ENTREZID",
+      ont           = "BP",
+      pAdjustMethod = "BH",
+      qvalueCutoff  = q,
+      readable      = FALSE
+    )
+    base_df <- as.data.frame(eg)
+  } else if (db == "KEGG") {
+    kk <- clusterProfiler::enrichKEGG(
+      gene          = genes,
+      organism      = "dre",
+      pAdjustMethod = "BH",
+      qvalueCutoff  = q
+    )
+    base_df <- as.data.frame(kk)
+  } else {
+    gp <- try(
+      gprofiler2::gost(
+        query              = genes,
+        organism           = "drerio",
+        sources            = db,
+        correction_method  = "g_SCS"
+      ),
+      silent = TRUE
+    )
+    if (inherits(gp, "try-error") || is.null(gp$result) || !nrow(gp$result)) {
+      return(data.frame())
+    }
+    base_df <- gp$result
+  }
+
+  if (!nrow(base_df)) return(data.frame())
+
+  df <- base_df
+
+  # Normalise column names
+  if (!"p.adjust" %in% names(df) && "p_value" %in% names(df))      df$p.adjust  <- df$p_value
+  if (!"Description" %in% names(df) && "term_name" %in% names(df)) df$Description <- df$term_name
+
+  # Which column carries the genes per term?
+  gene_col <- if ("geneID" %in% names(df)) {
+    "geneID"
+  } else if ("intersection" %in% names(df)) {
+    "intersection"
+  } else {
+    NA_character_
+  }
+
+  target_min <- target_df %>%
+    dplyr::select(ENTREZID, SYMBOL, miRNA) %>%
+    dplyr::distinct()
+
+  genes_list <- character(nrow(df))
+  mirna_list <- character(nrow(df))
+
+  for (i in seq_len(nrow(df))) {
+    gvec <- character(0)
+    if (!is.na(gene_col)) {
+      raw <- as.character(df[[gene_col]][i])
+      if (!is.na(raw) && nzchar(raw)) {
+        sep <- if (gene_col == "geneID") "/" else ","
+        gvec <- strsplit(raw, sep, fixed = TRUE)[[1]]
+        gvec <- trimws(gvec)
+      }
+    }
+
+    # For clusterProfiler, geneID is ENTREZ; for gprofiler, intersection is usually symbols
+    if (gene_col == "geneID") {
+      subdf <- dplyr::filter(target_min, ENTREZID %in% gvec)
+    } else if (gene_col == "intersection") {
+      subdf <- dplyr::filter(target_min, SYMBOL %in% gvec)
+    } else {
+      subdf <- target_min[0, ]
+    }
+
+    genes_list[i] <- paste(sort(unique(subdf$SYMBOL)), collapse = ",")
+    mirna_list[i] <- paste(sort(unique(subdf$miRNA)),  collapse = ",")
+  }
+
+  out <- data.frame(
+    Term             = df$Description,
+    Adjusted.P.value = df$p.adjust,
+    Combined.Score   = -log10(df$p.adjust),
+    Genes            = genes_list,
+    miRNAs           = mirna_list,
+    stringsAsFactors = FALSE
+  )
+
+  out <- out[order(out$Adjusted.P.value), ]
+  out
+}
+
+
+  safe_mm <- function(tbl) {
+    try(R.utils::withTimeout(
+      multiMiR::get_multimir(org = "hsa", mirna = hsa_mirs, table = tbl, summary = FALSE),
+      timeout = 25, onTimeout = "error"
+    ), silent = TRUE)
+  }
+
+  v <- safe_mm("validated")
+  p <- safe_mm("predicted")
+
   hdat <- dplyr::bind_rows(
     if (!inherits(v,"try-error") && !is.null(v) && nrow(v@data)) tibble::as_tibble(v@data) else NULL,
     if (!inherits(p,"try-error") && !is.null(p) && nrow(p@data)) tibble::as_tibble(p@data) else NULL
   )
-  if (!nrow(hdat)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
-  human_sym <- unique(hdat$target_symbol); human_sym <- human_sym[!is.na(human_sym) & human_sym != ""]
-  if (!length(human_sym)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
+  if (!nrow(hdat)) {
+    return(tibble::tibble(miRNA   = character(),
+                          SYMBOL   = character(),
+                          ENTREZID = character()))
+  }
+
+  # human miRNA + human target symbol
+  h_map <- hdat %>%
+    dplyr::transmute(
+      miRNA_hsa = as.character(mature_mirna_id),
+      SYMBOL_hsa = as.character(target_symbol)
+    ) %>%
+    dplyr::filter(!is.na(SYMBOL_hsa), SYMBOL_hsa != "")
+
+  human_sym <- unique(h_map$SYMBOL_hsa)
+  if (!length(human_sym)) {
+    return(tibble::tibble(miRNA   = character(),
+                          SYMBOL   = character(),
+                          ENTREZID = character()))
+  }
+
   ortho <- try(gprofiler2::gorth(human_sym, "hsapiens", "drerio"), silent = TRUE)
-  if (inherits(ortho,"try-error") || is.null(ortho) || !nrow(ortho)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
+  if (inherits(ortho, "try-error") || is.null(ortho) || !nrow(ortho)) {
+    return(tibble::tibble(miRNA   = character(),
+                          SYMBOL   = character(),
+                          ENTREZID = character()))
+  }
+
+  # pick a reasonable symbol column
   sym_col <- intersect(c("ortholog_name","name","target_name","ortholog_gene_name"), colnames(ortho))
-  if (!length(sym_col)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
-  dr_sym <- unique(ortho[[sym_col[1]]]); dr_sym <- dr_sym[!is.na(dr_sym) & dr_sym != ""]
-  if (!length(dr_sym)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
-  map <- safe_select(org.Dr.eg.db, dr_sym, "SYMBOL", "ENTREZID")
-  if (!nrow(map)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
-  map %>% dplyr::transmute(SYMBOL=as.character(SYMBOL), ENTREZID=as.character(ENTREZID)) %>%
-    dplyr::filter(!is.na(ENTREZID),ENTREZID!="") %>% dplyr::distinct()
+  src_col <- intersect(c("input","query","target_name","name"), colnames(ortho))
+  if (!length(sym_col) || !length(src_col)) {
+    return(tibble::tibble(miRNA   = character(),
+                          SYMBOL   = character(),
+                          ENTREZID = character()))
+  }
+
+  ortho_df <- ortho[, c(src_col[1], sym_col[1])]
+  names(ortho_df) <- c("SYMBOL_hsa","SYMBOL_dr")
+
+  merged <- dplyr::inner_join(h_map, ortho_df, by = "SYMBOL_hsa") %>%
+    dplyr::distinct(miRNA_hsa, SYMBOL_dr)
+
+  if (!nrow(merged)) {
+    return(tibble::tibble(miRNA   = character(),
+                          SYMBOL   = character(),
+                          ENTREZID = character()))
+  }
+
+  map_dr <- safe_select(org.Dr.eg.db,
+                        unique(merged$SYMBOL_dr),
+                        keytype = "SYMBOL",
+                        columns = "ENTREZID")
+
+  if (!nrow(map_dr)) {
+    return(tibble::tibble(miRNA   = character(),
+                          SYMBOL   = character(),
+                          ENTREZID = character()))
+  }
+
+  full <- merged %>%
+    dplyr::inner_join(map_dr, by = c("SYMBOL_dr" = "SYMBOL")) %>%
+    dplyr::transmute(
+      miRNA   = miRNA_hsa,
+      SYMBOL  = SYMBOL_dr,
+      ENTREZID = as.character(ENTREZID)
+    )
+
+  full %>%
+    dplyr::filter(!is.na(ENTREZID), ENTREZID != "") %>%
+    dplyr::distinct(miRNA, SYMBOL, ENTREZID)
 }
 
 dr_enrich_from_targets <- function(target_df, db = "GO:BP", q = 0.05) {
@@ -199,31 +651,228 @@ dr_enrich_from_targets <- function(target_df, db = "GO:BP", q = 0.05) {
 # ---------------------- Fly (dme): human targets → orthology → dmel ----------------------
 .to_hsa_from_dme <- function(mi) sub("^dme-", "hsa-", as.character(mi), ignore.case = TRUE)
 
+# ---------------------- Fly (dme): human targets → orthology → dmel ----------------------
+
+.to_hsa_from_dme <- function(mi) sub("^dme-", "hsa-", as.character(mi), ignore.case = TRUE)
+
 dm_targets_df <- function(mirnas) {
+  # Convert dme-miR-XXX to hsa-miR-XXX
   hsa_mirs <- unique(stats::na.omit(.to_hsa_from_dme(mirnas)))
-  if (!length(hsa_mirs)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
-  pull_mm <- function(tbl) try(R.utils::withTimeout(
-    multiMiR::get_multimir(org="hsa", mirna=hsa_mirs, table=tbl, summary=FALSE),
-    timeout = 25, onTimeout="error"), silent=TRUE)
-  v <- pull_mm("validated"); p <- pull_mm("predicted")
+  if (!length(hsa_mirs)) {
+    return(data.frame(miRNA = character(),
+                      SYMBOL = character(),
+                      ENTREZID = character(),
+                      stringsAsFactors = FALSE))
+  }
+
+  pull_mm <- function(tbl) {
+    try(R.utils::withTimeout(
+      multiMiR::get_multimir(org = "hsa",
+                             mirna = hsa_mirs,
+                             table = tbl,
+                             summary = FALSE),
+      timeout = 25,
+      onTimeout = "error"
+    ), silent = TRUE)
+  }
+
+  v <- pull_mm("validated")
+  p <- pull_mm("predicted")
+
   hdat <- dplyr::bind_rows(
-    if (!inherits(v,"try-error") && !is.null(v) && nrow(v@data)) tibble::as_tibble(v@data) else NULL,
-    if (!inherits(p,"try-error") && !is.null(p) && nrow(p@data)) tibble::as_tibble(p@data) else NULL
+    if (!inherits(v, "try-error") && !is.null(v) && nrow(v@data)) as.data.frame(v@data) else NULL,
+    if (!inherits(p, "try-error") && !is.null(p) && nrow(p@data)) as.data.frame(p@data) else NULL
   )
-  if (!nrow(hdat)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
-  human_sym <- unique(hdat$target_symbol); human_sym <- human_sym[!is.na(human_sym) & human_sym != ""]
-  if (!length(human_sym)) return(tibble::tibble(SYMBOL = character(), ENTREZID = character()))
-  ortho <- try(gprofiler2::gorth(human_sym, "hsapiens", "dmelanogaster"), silent = TRUE)
-  if (inherits(ortho,"try-error") || is.null(ortho) || !nrow(ortho)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
-  sym_col <- intersect(c("ortholog_name","name","target_name","ortholog_gene_name"), colnames(ortho))
-  if (!length(sym_col)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
-  dm_sym <- unique(ortho[[sym_col[1]]]); dm_sym <- dm_sym[!is.na(dm_sym) & dm_sym != ""]
-  if (!length(dm_sym)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
-  map <- safe_select(org.Dm.eg.db, dm_sym, "SYMBOL", "ENTREZID")
-  if (!nrow(map)) return(tibble::tibble(SYMBOL=character(),ENTREZID=character()))
-  map %>% dplyr::transmute(SYMBOL=as.character(SYMBOL), ENTREZID=as.character(ENTREZID)) %>%
-    dplyr::filter(!is.na(ENTREZID),ENTREZID!="") %>% dplyr::distinct()
+
+  if (!nrow(hdat)) {
+    return(data.frame(miRNA = character(),
+                      SYMBOL = character(),
+                      ENTREZID = character(),
+                      stringsAsFactors = FALSE))
+  }
+
+  hdat_small <- hdat %>%
+    dplyr::transmute(
+      hsa_miRNA    = as.character(mature_mirna_id),
+      human_symbol = as.character(target_symbol)
+    ) %>%
+    dplyr::filter(
+      !is.na(hsa_miRNA), hsa_miRNA != "",
+      !is.na(human_symbol), human_symbol != ""
+    ) %>%
+    dplyr::distinct()
+
+  ortho <- try(
+    gprofiler2::gorth(unique(hdat_small$human_symbol), "hsapiens", "dmelanogaster"),
+    silent = TRUE
+  )
+  if (inherits(ortho, "try-error") || is.null(ortho) || !nrow(ortho)) {
+    return(data.frame(miRNA = character(),
+                      SYMBOL = character(),
+                      ENTREZID = character(),
+                      stringsAsFactors = FALSE))
+  }
+
+  # Columns for human vs fly symbols
+  human_col <- if ("name" %in% colnames(ortho)) {
+    "name"
+  } else if ("input" %in% colnames(ortho)) {
+    "input"
+  } else {
+    colnames(ortho)[1]
+  }
+
+  dm_col <- if ("ortholog_name" %in% colnames(ortho)) {
+    "ortholog_name"
+  } else if ("target_name" %in% colnames(ortho)) {
+    "target_name"
+  } else if ("name" %in% colnames(ortho) && human_col != "name") {
+    "name"
+  } else {
+    colnames(ortho)[2]
+  }
+
+  map_df <- ortho[, c(human_col, dm_col)]
+  colnames(map_df) <- c("human_symbol", "dm_symbol")
+  map_df <- map_df %>%
+    dplyr::filter(!is.na(dm_symbol), dm_symbol != "") %>%
+    dplyr::distinct()
+
+  joined <- dplyr::inner_join(hdat_small, map_df, by = "human_symbol")
+  if (!nrow(joined)) {
+    return(data.frame(miRNA = character(),
+                      SYMBOL = character(),
+                      ENTREZID = character(),
+                      stringsAsFactors = FALSE))
+  }
+
+  ann <- safe_select(org.Dm.eg.db,
+                     unique(joined$dm_symbol),
+                     keytype = "SYMBOL",
+                     columns = "ENTREZID")
+  if (!nrow(ann)) {
+    return(data.frame(miRNA = character(),
+                      SYMBOL = character(),
+                      ENTREZID = character(),
+                      stringsAsFactors = FALSE))
+  }
+
+  out <- dplyr::inner_join(joined, ann, by = c("dm_symbol" = "SYMBOL")) %>%
+    dplyr::transmute(
+      miRNA   = sub("^hsa-", "dme-", hsa_miRNA, ignore.case = TRUE),
+      SYMBOL  = as.character(dm_symbol),
+      ENTREZID = as.character(ENTREZID)
+    ) %>%
+    dplyr::filter(!is.na(ENTREZID), ENTREZID != "") %>%
+    dplyr::distinct()
+
+  out
 }
+
+dm_enrich_from_targets <- function(target_df, db = "GO:BP", q = 0.05) {
+  if (!is.data.frame(target_df) || !nrow(target_df)) return(data.frame())
+
+  if (!"miRNA" %in% names(target_df))  target_df$miRNA  <- NA_character_
+  if (!"SYMBOL" %in% names(target_df)) target_df$SYMBOL <- NA_character_
+
+  genes <- unique(target_df$ENTREZID)
+  genes <- genes[!is.na(genes) & genes != ""]
+  if (length(genes) < 10) return(data.frame())
+
+  base_df <- NULL
+
+  if (db == "GO:BP") {
+    eg <- clusterProfiler::enrichGO(
+      gene          = genes,
+      OrgDb         = org.Dm.eg.db,
+      keyType       = "ENTREZID",
+      ont           = "BP",
+      pAdjustMethod = "BH",
+      qvalueCutoff  = q,
+      readable      = FALSE
+    )
+    base_df <- as.data.frame(eg)
+  } else if (db == "KEGG") {
+    kk <- clusterProfiler::enrichKEGG(
+      gene          = genes,
+      organism      = "dme",
+      pAdjustMethod = "BH",
+      qvalueCutoff  = q
+    )
+    base_df <- as.data.frame(kk)
+  } else {
+    gp <- try(
+      gprofiler2::gost(
+        query              = genes,
+        organism           = "dmelanogaster",
+        sources            = db,
+        correction_method  = "g_SCS"
+      ),
+      silent = TRUE
+    )
+    if (inherits(gp, "try-error") || is.null(gp$result) || !nrow(gp$result)) {
+      return(data.frame())
+    }
+    base_df <- gp$result
+  }
+
+  if (!nrow(base_df)) return(data.frame())
+
+  df <- base_df
+  if (!"p.adjust" %in% names(df) && "p_value" %in% names(df))      df$p.adjust   <- df$p_value
+  if (!"Description" %in% names(df) && "term_name" %in% names(df)) df$Description <- df$term_name
+
+  gene_col <- if ("geneID" %in% names(df)) {
+    "geneID"
+  } else if ("intersection" %in% names(df)) {
+    "intersection"
+  } else {
+    NA_character_
+  }
+
+  target_min <- target_df %>%
+    dplyr::select(ENTREZID, SYMBOL, miRNA) %>%
+    dplyr::distinct()
+
+  genes_list <- character(nrow(df))
+  mirna_list <- character(nrow(df))
+
+  for (i in seq_len(nrow(df))) {
+    gvec <- character(0)
+    if (!is.na(gene_col)) {
+      raw <- as.character(df[[gene_col]][i])
+      if (!is.na(raw) && nzchar(raw)) {
+        sep <- if (gene_col == "geneID") "/" else ","
+        gvec <- strsplit(raw, sep, fixed = TRUE)[[1]]
+        gvec <- trimws(gvec)
+      }
+    }
+
+    if (gene_col == "geneID") {
+      subdf <- dplyr::filter(target_min, ENTREZID %in% gvec)
+    } else if (gene_col == "intersection") {
+      subdf <- dplyr::filter(target_min, SYMBOL %in% gvec)
+    } else {
+      subdf <- target_min[0, ]
+    }
+
+    genes_list[i] <- paste(sort(unique(subdf$SYMBOL)), collapse = ",")
+    mirna_list[i] <- paste(sort(unique(subdf$miRNA)),  collapse = ",")
+  }
+
+  out <- data.frame(
+    Term             = df$Description,
+    Adjusted.P.value = df$p.adjust,
+    Combined.Score   = -log10(df$p.adjust),
+    Genes            = genes_list,
+    miRNAs           = mirna_list,
+    stringsAsFactors = FALSE
+  )
+
+  out <- out[order(out$Adjusted.P.value), ]
+  out
+}
+
 
 dm_enrich_from_targets <- function(target_df, db = "GO:BP", q = 0.05) {
   if (!is.data.frame(target_df) || !nrow(target_df)) return(data.frame())
@@ -941,3 +1590,4 @@ shinyApp(ui, server)
 
   
   
+
