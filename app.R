@@ -878,17 +878,33 @@ renderEnrichPlot <- function(df) {
 }
 
 renderEnrichTable <- function(df) {
-  if (is.null(df) || nrow(df) == 0) return(data.frame(Message="No enrichment results"))
-  d <- as.data.frame(df); nm <- tolower(gsub("\\.","_",names(d)))
-  ap <- which(nm %in% c("adjusted_p_value","adjusted.p.value","p_value","padj"))[1]
-  tm <- which(nm %in% c("term","description","term_name"))[1]
+  if (is.null(df) || nrow(df) == 0)
+    return(data.frame(Message = "No enrichment results"))
+
+  d  <- as.data.frame(df)
+  nm <- tolower(gsub("\\.", "_", names(d)))
+
+  # Detect key columns (robust to different tools)
+  ap <- which(nm %in% c("adjusted_p_value", "adjusted.p.value", "p_value", "padj"))[1]
+  tm <- which(nm %in% c("term", "description", "term_name"))[1]
+  gn <- which(nm %in% c("genes", "gene", "geneid", "gene_id", "overlap_genes"))[1]
+
   if (!is.na(ap)) names(d)[ap] <- "Adjusted_P_value"
   if (!is.na(tm)) names(d)[tm] <- "Term"
-  keep <- c("Term","Adjusted_P_value"); keep <- keep[keep %in% names(d)]
-  d <- d[, keep, drop=FALSE]
-  if ("Adjusted_P_value" %in% names(d)) d$Adjusted_P_value <- signif(d$Adjusted_P_value,4)
+  if (!is.na(gn)) names(d)[gn] <- "Genes"
+
+  # Decide which columns to show
+  keep <- c("Term", "Adjusted_P_value", "Genes")
+  keep <- keep[keep %in% names(d)]
+
+  d <- d[, keep, drop = FALSE]
+
+  if ("Adjusted_P_value" %in% names(d))
+    d$Adjusted_P_value <- signif(d$Adjusted_P_value, 4)
+
   d
 }
+
 
 # ===================== UI =====================
 ui <- fluidPage(
@@ -1004,20 +1020,40 @@ server <- function(input, output, session) {
     if (length(common) < 4) { showNotification("Need ≥4 overlapping samples.", type="error"); return(NULL) }
     count_matrix <- count_matrix[, common, drop = FALSE]
     meta_data    <- meta_data[common, , drop = FALSE]
+# --- Dynamically detect groups from metadata$group ---
+grp_levels <- levels(factor(meta_data$group))
 
-    meta_data$condition <- factor(meta_data$group, levels = c("Control","LPS"))
-    use_batch <- "batch" %in% names(meta_data) && nlevels(factor(meta_data$batch)) > 1
-    if (use_batch) meta_data$batch <- factor(meta_data$batch)
+# Require exactly 2 groups for DESeq2 contrast
+if (length(grp_levels) != 2) {
+  showNotification(
+    paste0(
+      "Group column 'group' must have exactly 2 levels for DE analysis. Found: ",
+      paste(grp_levels, collapse = ", ")
+    ),
+    type = "error"
+  )
+  return(NULL)
+}
 
-    reps <- table(meta_data$condition)
-    if (any(reps < 2)) {
-      showNotification(
-        paste("Need ≥2 replicates per group. Found:", paste(names(reps), reps, collapse=" / ")),
-        type="error"
-      )
-      return(NULL)
-    }
-    design_formula <- if (use_batch) ~ batch + condition else ~ condition
+# Make 'condition' the factor DESeq2 will use
+meta_data$condition <- factor(meta_data$group, levels = grp_levels)
+
+# Optional batch covariate
+use_batch <- "batch" %in% names(meta_data) && nlevels(factor(meta_data$batch)) > 1
+if (use_batch) meta_data$batch <- factor(meta_data$batch)
+
+# Check replicates per group
+reps <- table(meta_data$condition)
+if (any(reps < 2)) {
+  showNotification(
+    paste("Need ≥2 replicates per group. Found:",
+          paste(names(reps), reps, collapse = " / ")),
+    type = "error"
+  )
+  return(NULL)
+}
+
+design_formula <- if (use_batch) ~ batch + condition else ~ condition
 
     # ---------- DESeq2 (robust with dispersion fallbacks) ----------
     dds <- DESeqDataSetFromMatrix(
@@ -1291,18 +1327,52 @@ server <- function(input, output, session) {
     })
   })
 
-  observeEvent(input$pcaBtn, {
-    req(vsdData())
-    vst <- t(assay(vsdData()))
-    vst <- vst[, apply(vst,2,function(x) sd(x,na.rm=TRUE) > 1e-8)]
-    validate(need(ncol(vst) >= 2, "Too few variable features for PCA"))
-    pca <- prcomp(vst, scale.=TRUE); pc <- as.data.frame(pca$x[,1:2])
-    pc$Sample <- rownames(pc); pc$Group <- vsdData()$condition
-    output$pcaPlot <- renderPlotly({
-      plot_ly(pc, x=~PC1, y=~PC2, color=~Group, text=~Sample,
-              type="scatter", mode="markers")
-    })
+observeEvent(input$pcaBtn, {
+  req(vsdData())
+
+  # Grab the DESeqTransform object once
+  vsd_obj <- vsdData()
+
+  # samples x features matrix
+  vst <- t(assay(vsd_obj))
+
+  # keep features with non-trivial variance
+  keep <- apply(vst, 2, function(x) sd(x, na.rm = TRUE) > 1e-8)
+  vst  <- vst[, keep, drop = FALSE]
+
+  # require at least 2 variable features (NO validate/need here)
+  if (ncol(vst) < 2) {
+    showNotification("Too few variable features for PCA", type = "error")
+    return(NULL)
+  }
+
+  # (optional but recommended) use top 500 most variable features
+  vars <- apply(vst, 2, var, na.rm = TRUE)
+  sel  <- order(vars, decreasing = TRUE)[seq_len(min(500, length(vars)))]
+  vst  <- vst[, sel, drop = FALSE]
+
+  # run PCA
+  pca <- prcomp(vst, scale. = TRUE)
+
+  pc <- as.data.frame(pca$x[, 1:2, drop = FALSE])
+  pc$Sample <- rownames(pc)
+
+  # get group/condition from colData
+  pc$Group <- as.factor(colData(vsd_obj)$condition)
+
+  output$pcaPlot <- renderPlotly({
+    plot_ly(
+      pc,
+      x     = ~PC1,
+      y     = ~PC2,
+      color = ~Group,
+      text  = ~Sample,
+      type  = "scatter",
+      mode  = "markers"
+    )
   })
+})
+
 
   observeEvent(input$umapBtn, {
     req(vsdData())
@@ -1419,5 +1489,4 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
-
 
