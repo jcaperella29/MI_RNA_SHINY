@@ -1,4 +1,4 @@
-"SampleID","SampleID","condition"
+"sample_ID","SampleID","condition"
 "MutN3","MutN3","Solid Tissue Normal"
 "MutN4","MutN4","Solid Tissue Normal"
 "MutN5","MutN5","Solid Tissue Normal"
@@ -16,3 +16,4 @@
 "WtP3","WtP3","Primary Tumor"
 "WtP4","WtP4","Primary Tumor"
 "WtP5","WtP5","Primary Tumor"
+
