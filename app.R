@@ -1002,24 +1002,92 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$runAnalysis, {
-    req(input$countsFile, input$metaFile)
-    showNotification("🧬 DESeq2 running…", type = "message")
+  req(input$countsFile, input$metaFile)
+  showNotification("🧬 DESeq2 running…", type = "message")
 
-    count_data <- readr::read_csv(input$countsFile$datapath, show_col_types = FALSE)
-    if (ncol(count_data) < 2) { showNotification("Counts file must have ≥2 columns.", type="error"); return(NULL) }
-    first_col_counts <- names(count_data)[1]
-    count_matrix <- as.matrix(count_data[, -1, drop = FALSE])
-    rownames(count_matrix) <- count_data[[first_col_counts]]
+  
+# counts
+ext_counts <- tools::file_ext(input$countsFile$name)
+count_data <- if (ext_counts == "csv") {
+  read.csv(input$countsFile$datapath, check.names = FALSE, stringsAsFactors = FALSE)
+} else {
+  read.table(input$countsFile$datapath, header = TRUE, sep = "\t",
+             check.names = FALSE, stringsAsFactors = FALSE)
+}
 
-    meta_data <- readr::read_csv(input$metaFile$datapath, show_col_types = FALSE) |> as.data.frame()
-    if (!("sample_id" %in% names(meta_data))) { showNotification("Metadata must have a 'sample_id' column.", type="error"); return(NULL) }
-    if (!("group" %in% names(meta_data)))     { showNotification("Metadata must have a 'group' column.", type="error"); return(NULL) }
-    rownames(meta_data) <- meta_data$sample_id
+# first column is feature IDs (miRNAs)
+first_col_counts <- names(count_data)[1]
+count_matrix <- as.matrix(count_data[, -1, drop = FALSE])
+rownames(count_matrix) <- count_data[[first_col_counts]]
 
-    common <- intersect(colnames(count_matrix), rownames(meta_data))
-    if (length(common) < 4) { showNotification("Need ≥4 overlapping samples.", type="error"); return(NULL) }
-    count_matrix <- count_matrix[, common, drop = FALSE]
-    meta_data    <- meta_data[common, , drop = FALSE]
+# metadata
+ext_meta <- tools::file_ext(input$metaFile$name)
+meta_data <- if (ext_meta == "csv") {
+  read.csv(input$metaFile$datapath, check.names = FALSE, stringsAsFactors = FALSE)
+} else {
+  read.table(input$metaFile$datapath, header = TRUE, sep = "\t",
+             check.names = FALSE, stringsAsFactors = FALSE)
+}
+
+# ---- NOW do minimal, safe column cleanup ----
+names(meta_data) <- trimws(names(meta_data))
+names(meta_data) <- sub("^\ufeff", "", names(meta_data))   # remove BOM if present
+names(meta_data) <- tolower(names(meta_data))
+names(meta_data) <- gsub("[^a-z0-9]+", "_", names(meta_data))
+names(meta_data) <- gsub("^_+|_+$", "", names(meta_data))
+
+# Recover the common failure mode you observed
+names(meta_data)[names(meta_data) %in% c("ample_id","ampleid")] <- "sample_id"
+
+# require expected columns
+if (!("sample_id" %in% names(meta_data))) {
+  showNotification(
+    paste0("Metadata must have 'sample_id'. I see: ",
+           paste(names(meta_data), collapse = ", ")),
+    type = "error"
+  )
+  return(NULL)
+}
+
+rownames(meta_data) <- meta_data$sample_id
+
+  # accept condition as group
+  if (!("group" %in% names(meta_data)) && ("condition" %in% names(meta_data))) {
+    meta_data$group <- meta_data$condition
+  }
+
+  # debug: show what the app sees
+  showNotification(paste("Meta cols:", paste(names(meta_data), collapse=" | ")),
+                   type="message", duration=15)
+
+  # accept condition as group
+  if (!("group" %in% names(meta_data)) && ("condition" %in% names(meta_data))) {
+    meta_data$group <- meta_data$condition
+  }
+
+  if (!("sample_id" %in% names(meta_data))) {
+    showNotification("Metadata must have a 'sample_id' column.", type="error")
+    return(NULL)
+  }
+  if (!("group" %in% names(meta_data))) {
+    showNotification("Metadata must have a 'group' (or 'condition') column.", type="error")
+    return(NULL)
+  }
+
+  rownames(meta_data) <- meta_data$sample_id
+
+  common <- intersect(colnames(count_matrix), rownames(meta_data))
+  if (length(common) < 4) {
+    showNotification("Need ≥4 overlapping samples.", type="error")
+    return(NULL)
+  }
+
+  count_matrix <- count_matrix[, common, drop = FALSE]
+  meta_data    <- meta_data[common, , drop = FALSE]
+
+  # ... keep the rest of your DESeq2 code exactly as you had it ...# ... keep the rest of your DESeq2 code exactly as you had it ..
+
+
 # --- Dynamically detect groups from metadata$group ---
 grp_levels <- levels(factor(meta_data$group))
 
@@ -1489,4 +1557,6 @@ observeEvent(input$pcaBtn, {
 }
 
 shinyApp(ui, server)
+
+
 
