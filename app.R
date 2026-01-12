@@ -1173,29 +1173,53 @@ design_formula <- if (use_batch) ~ batch + condition else ~ condition
     dds <- fit$dds
     showNotification(paste("DESeq2 dispersion fit:", fit$method), type = "message", duration = 4)
 
-    # ----- Build results object (robustly find contrast) -----
-    rn <- resultsNames(dds)  # e.g., "Intercept", "condition_LPS_vs_Control"
-    coef_name <- rn[grepl("^condition_.*_vs_.*$", rn)]
+# ----- Build results object (robust; no hard-coded group names) -----
+rn <- resultsNames(dds)
 
-    res <- try({
-      if (length(coef_name) == 1 &&
-          requireNamespace("apeglm", quietly = TRUE) &&
-          fit$method != "gene-wise") {
-        lfcShrink(dds, coef = coef_name, type = "apeglm")
-      } else if (length(coef_name) == 1) {
-        results(dds, name = coef_name)
-      } else {
-        results(dds, contrast = c("condition", "LPS", "Control"))
-      }
-    }, silent = TRUE)
+# Prefer the DESeq2-generated condition coef(s), e.g. "condition_Treated_vs_Control"
+cond_coef <- rn[grepl("^condition_.+_vs_.+$", rn)]
 
-    if (inherits(res, "try-error")) {
-      res <- results(dds, contrast = c("condition", "LPS", "Control"))
+# Determine factor levels from the dataset itself
+cond_levels <- levels(colData(dds)$condition)
+
+# Choose a sensible default contrast: (level2 vs level1)
+# (DESeq2’s coef is also typically “levelX_vs_level1” where level1 is reference.)
+if (length(cond_levels) >= 2) {
+  ref_level <- cond_levels[1]
+  test_level <- cond_levels[2]
+} else {
+  ref_level <- NA_character_
+  test_level <- NA_character_
+}
+
+res <- tryCatch({
+  if (length(cond_coef) == 1) {
+    # We have a single unambiguous coefficient; use it
+    if (requireNamespace("apeglm", quietly = TRUE) && fit$method != "gene-wise") {
+      DESeq2::lfcShrink(dds, coef = cond_coef, type = "apeglm")
+    } else {
+      DESeq2::results(dds, name = cond_coef)
     }
+  } else {
+    # Multiple (or zero) coefficients: fall back to explicit contrast from factor levels
+    if (is.na(test_level) || is.na(ref_level)) {
+      stop("Could not determine two condition levels for contrast.")
+    }
+    DESeq2::results(dds, contrast = c("condition", test_level, ref_level))
+  }
+}, error = function(e) {
+  # Final fallback: if coefficient matching failed, still try contrast from levels
+  if (!is.na(test_level) && !is.na(ref_level)) {
+    DESeq2::results(dds, contrast = c("condition", test_level, ref_level))
+  } else {
+    stop(e)
+  }
+})
 
-    res_df <- as.data.frame(res) %>%
-      tibble::rownames_to_column("miRNA") %>%
-      dplyr::mutate(sig = !is.na(padj) & padj < 0.1)
+res_df <- as.data.frame(res) %>%
+  tibble::rownames_to_column("miRNA") %>%
+  dplyr::mutate(sig = !is.na(padj) & padj < 0.1)
+
 
     # ---------- RandomForest ranking on top-20 by padj ----------
     top20 <- res_df %>%
@@ -1557,6 +1581,7 @@ observeEvent(input$pcaBtn, {
 }
 
 shinyApp(ui, server)
+
 
 
 
