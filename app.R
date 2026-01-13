@@ -14,10 +14,35 @@ suppressPackageStartupMessages({
   library(org.Dr.eg.db)   # zebrafish
   library(org.Dm.eg.db)   # fly
 })
+normalize_mirna_ids <- function(mirnas, species = c("hs","mm")) {
+  species <- match.arg(species)
+  prefix  <- if (species == "hs") "hsa-" else "mmu-"
+  
+  x <- as.character(mirnas)
+  x <- trimws(x)
+  x <- x[!is.na(x) & x != ""]
+  
+  # Normalize separators/case
+  x <- gsub("_", "-", x)
+  x <- gsub("\\s+", "", x)
+  x <- gsub("^mir-", "miR-", x, ignore.case = TRUE)
+  x <- gsub("^mir",  "miR",  x, ignore.case = TRUE)
+  
+  # If IDs have no species prefix, add it
+  has_prefix <- grepl("^(hsa-|mmu-|dre-|dme-)", x, ignore.case = TRUE)
+  x[!has_prefix] <- paste0(prefix, x[!has_prefix])
+  
+  # Force canonical prefix casing
+  x <- sub("^hsa-", "hsa-", x, ignore.case = TRUE)
+  x <- sub("^mmu-", "mmu-", x, ignore.case = TRUE)
+  
+  unique(x)
+}
 
-options(timeout = 15)  # cap slow network calls
 
-# Simple null-coalescing helper for safety
+
+
+options(timeout = 3000)  # Simple null-coalescing helper for safety
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
 # ---- Static CSV fallback ----
@@ -26,10 +51,7 @@ mirna_static_targets <- tryCatch(
   error = function(e) data.frame(mirna = character(), target = character())
 )
 
-get_targets_from_csv <- function(mirnas, static_df = mirna_static_targets) {
-  if (nrow(static_df) == 0) return(static_df)
-  static_df %>% filter(tolower(mirna) %in% tolower(mirnas))
-}
+
 
 # ---- Species helpers ----
 detect_species <- function(mirnas, fallback = "hs") {
@@ -142,7 +164,7 @@ mm_targets_df <- function(mirnas) {
   safe_mm <- function(org, mirs, table) {
     try(R.utils::withTimeout(
       multiMiR::get_multimir(org = org, mirna = mirs, table = table, summary = FALSE),
-      timeout = 25, onTimeout = "error"
+      timeout = 2000, onTimeout = "error"
     ), silent = TRUE)
   }
 
@@ -330,7 +352,7 @@ dr_targets_df <- function(mirnas) {
                              mirna = hsa_mirs,
                              table = tbl,
                              summary = FALSE),
-      timeout = 25,
+      timeout = 2000,
       onTimeout = "error"
     ), silent = TRUE)
   }
@@ -818,49 +840,83 @@ enrich_species <- function(genes, db, species) {
 # ===================== Generic target retrieval (kept, no miRNAtap) =====================
 get_targets <- function(mirnas, species) {
   mirnas <- unique(stats::na.omit(mirnas))
-  if (length(mirnas) < 1)
+  if (!length(mirnas)) {
     return(data.frame(mirna = character(), target = character(),
-                      evidence = character(), source = character()))
+                      evidence = character(), source = character(),
+                      stringsAsFactors = FALSE))
+  }
+  
+  sp <- tolower(as.character(species))
+  mm_org <- MM_ORG[[sp]] %||% NA_character_
+  
+  # Only human/mouse supported by this generic multiMiR path
+  if (is.na(mm_org) || !mm_org %in% c("hsa", "mmu")) {
+    return(data.frame(mirna = character(), target = character(),
+                      evidence = character(), source = character(),
+                      stringsAsFactors = FALSE))
+  }
+  
+  # Normalize IDs BEFORE querying multiMiR
+  sp2 <- if (mm_org == "hsa") "hs" else "mm"
+  mirnas_norm <- normalize_mirna_ids(mirnas, species = sp2)
+  
+  safe_multimir_chunked <- function(org, mirnas, table, chunk_size = 50) {
+    mirnas <- unique(stats::na.omit(mirnas))
+    if (!length(mirnas)) return(NULL)
+    
+    chunks <- split(mirnas, ceiling(seq_along(mirnas) / chunk_size))
+    out <- list()
+    
+    for (i in seq_along(chunks)) {
+      m <- chunks[[i]]
+      res <- try(
+        R.utils::withTimeout(
+          multiMiR::get_multimir(org = org, mirna = m, table = table, summary = FALSE),
+          timeout = 2000, onTimeout = "error"
+        ),
+        silent = TRUE
+      )
+      if (!inherits(res, "try-error") && !is.null(res) && nrow(res@data) > 0) {
+        out[[length(out) + 1]] <- as.data.frame(res@data)
+      }
+    }
+    
+    if (!length(out)) return(NULL)
+    do.call(rbind, out)
+  }
+  
   out <- list()
-  mm_org <- MM_ORG[[species]] %||% NA_character_
-
-  safe_multimir <- function(org, mirnas, table) {
-    try(R.utils::withTimeout(
-      multiMiR::get_multimir(org = org, mirna = mirnas, table = table, summary = FALSE),
-      timeout = 25, onTimeout = "error"
-    ), silent = TRUE)
+  
+  mm_val_df <- safe_multimir_chunked(mm_org, mirnas_norm, "validated")
+  if (!is.null(mm_val_df) && nrow(mm_val_df) > 0) {
+    df <- mm_val_df[, c("mature_mirna_id", "target_symbol", "database"), drop = FALSE]
+    names(df) <- c("mirna", "target", "source")
+    df$evidence <- "validated"
+    out$validated <- df[, c("mirna", "target", "evidence", "source")]
   }
-
-  if (!is.na(mm_org) && mm_org %in% c("hsa","mmu")) {
-    mm_val <- safe_multimir(mm_org, mirnas, "validated")
-    if (!inherits(mm_val, "try-error") && !is.null(mm_val) && nrow(mm_val@data) > 0) {
-      df <- as.data.frame(mm_val@data)[, c("mature_mirna_id","target_symbol","database"), drop = FALSE]
-      names(df) <- c("mirna","target","source"); df$evidence <- "validated"
-      out$validated <- df[, c("mirna","target","evidence","source")]
-    }
-    mm_pred <- safe_multimir(mm_org, mirnas, "predicted")
-    if (!inherits(mm_pred, "try-error") && !is.null(mm_pred) && nrow(mm_pred@data) > 0) {
-      df <- as.data.frame(mm_pred@data)[, c("mature_mirna_id","target_symbol","database"), drop = FALSE]
-      names(df) <- c("mirna","target","source"); df$evidence <- "predicted"
-      out$predicted <- df[, c("mirna","target","evidence","source")]
-    }
+  
+  mm_pred_df <- safe_multimir_chunked(mm_org, mirnas_norm, "predicted")
+  if (!is.null(mm_pred_df) && nrow(mm_pred_df) > 0) {
+    df <- mm_pred_df[, c("mature_mirna_id", "target_symbol", "database"), drop = FALSE]
+    names(df) <- c("mirna", "target", "source")
+    df$evidence <- "predicted"
+    out$predicted <- df[, c("mirna", "target", "evidence", "source")]
   }
-
-  csv_df <- get_targets_from_csv(mirnas)
-  if (nrow(csv_df) > 0) {
-    csv_df$evidence <- "csv"; csv_df$source <- "csv"
-    out$csv <- csv_df[, c("mirna","target","evidence","source")]
-  }
-
-  if (length(out) == 0)
+  
+  if (!length(out)) {
     return(data.frame(mirna = character(), target = character(),
-                      evidence = character(), source = character()))
-
+                      evidence = character(), source = character(),
+                      stringsAsFactors = FALSE))
+  }
+  
   ans <- do.call(rbind, out)
-  ans <- ans[!duplicated(ans[, c("mirna","target","evidence")]), ]
+  ans <- ans[!duplicated(ans[, c("mirna", "target", "evidence")]), ]
   rownames(ans) <- NULL
   ans
 }
+
+ 
+  
 
 # ---- Plot/table helpers ----
 renderEnrichPlot <- function(df) {
@@ -983,7 +1039,8 @@ server <- function(input, output, session) {
   enrichAll  <- reactiveVal(NULL)
   enrichUp   <- reactiveVal(NULL)
   enrichDown <- reactiveVal(NULL)
-
+  deAllDF <- reactiveVal(NULL)   # FULL DESeq2 results (all miRNAs)
+  
   rf_preds      <- reactiveVal(NULL)
   rf_metrics    <- reactiveVal(NULL)
   rf_importance <- reactiveVal(NULL)
@@ -1220,6 +1277,9 @@ res_df <- as.data.frame(res) %>%
   tibble::rownames_to_column("miRNA") %>%
   dplyr::mutate(sig = !is.na(padj) & padj < 0.1)
 
+deAllDF(res_df)  # <-- ADD THIS LINE
+
+
 
     # ---------- RandomForest ranking on top-20 by padj ----------
     top20 <- res_df %>%
@@ -1281,13 +1341,15 @@ res_df <- as.data.frame(res) %>%
   })
 
   do_enrich <- function(which_set = c("all","up","down")) {
-    req(resultsDF())
-    df <- resultsDF()
+    req(deAllDF())
+    df <- deAllDF()
+    
     which_set <- match.arg(which_set)
 
     mirnas <- switch(
       which_set,
-      all  = df$miRNA,
+      all = df %>% dplyr::filter(!is.na(padj), padj < 0.1) %>% dplyr::pull(miRNA),
+      
       up   = df %>% dplyr::filter(!is.na(padj), padj < 0.1, log2FoldChange > 0) %>% dplyr::pull(miRNA),
       down = df %>% dplyr::filter(!is.na(padj), padj < 0.1, log2FoldChange < 0) %>% dplyr::pull(miRNA)
     )
@@ -1581,6 +1643,7 @@ observeEvent(input$pcaBtn, {
 }
 
 shinyApp(ui, server)
+
 
 
 
